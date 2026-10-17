@@ -1,0 +1,21 @@
+# Local development: only the database. Run the backend with `uv run` and the
+# frontend with `npm run dev` so both reload on change.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: orchestrator
+      POSTGRES_PASSWORD: orchestrator
+      POSTGRES_DB: orchestrator
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U orchestrator"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+volumes:
+  db-data:
