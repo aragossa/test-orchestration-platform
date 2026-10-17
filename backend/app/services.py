@@ -96,12 +96,14 @@ class RunService:
                 )
                 await self.repo.skip_unfinished_tests(run_id, "Skipped: run cancelled")
                 await self.repo.add_event(run_id, "Run cancelled while queued", level="warning")
+                self.repo.session.expire_all()
                 return await self.get_run(run_id)
             except StaleRunError:
                 pass  # a worker picked it up meanwhile; fall through to the flag
 
         await self.repo.request_cancel(run_id)
         await self.repo.add_event(run_id, "Cancellation requested by user", level="warning")
+        self.repo.session.expire_all()
         return await self.get_run(run_id)
 
     async def list_environments(self) -> list[Environment]:

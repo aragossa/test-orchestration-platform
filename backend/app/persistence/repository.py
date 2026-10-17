@@ -242,7 +242,9 @@ class RunRepository:
         """Take ownership of queued runs whose environment is free.
 
         FOR UPDATE SKIP LOCKED lets several workers poll concurrently without
-        ever handing the same run to two of them.
+        ever handing the same run to two of them. Only the oldest queued run
+        per environment is taken in one pass, so two runs targeting the same
+        environment are never started together.
         """
         if limit <= 0:
             return []
@@ -255,29 +257,36 @@ class RunRepository:
             )
         )
         candidates = (
-            select(Run.id)
+            select(Run.id, Run.environment_id)
             .where(
                 Run.state == RunState.PENDING,
                 or_(Run.worker_id.is_(None), Run.lease_expires_at < now),
                 ~env_busy,
             )
             .order_by(Run.id)
-            .limit(limit)
             .with_for_update(skip_locked=True)
         )
-        stmt = (
-            update(Run)
-            .where(Run.id.in_(candidates))
-            .values(
-                worker_id=worker_id,
-                lease_expires_at=now + timedelta(seconds=lease_seconds),
-                updated_at=now,
+        chosen: list[int] = []
+        seen_environments: set[str] = set()
+        for run_id, environment_id in (await self.session.execute(candidates)).all():
+            if environment_id in seen_environments:
+                continue
+            seen_environments.add(environment_id)
+            chosen.append(run_id)
+            if len(chosen) == limit:
+                break
+        if chosen:
+            await self.session.execute(
+                update(Run)
+                .where(Run.id.in_(chosen))
+                .values(
+                    worker_id=worker_id,
+                    lease_expires_at=now + timedelta(seconds=lease_seconds),
+                    updated_at=now,
+                )
             )
-            .returning(Run.id)
-        )
-        ids = sorted((await self.session.scalars(stmt)).all())
         await self.session.commit()
-        return ids
+        return chosen
 
     async def reclaim_abandoned_runs(
         self, worker_id: str, lease_seconds: int, limit: int, *, include_own: bool = False

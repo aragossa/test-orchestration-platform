@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from pydantic import ValidationError
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -94,20 +95,30 @@ async def list_tests(session: SessionDep) -> list[TestDefinitionOut]:
     responses=ERROR_RESPONSES,
 )
 async def create_run(payload: RunCreate, svc: ServiceDep) -> RunDetailOut:
-    config = RunConfig(
-        environment=payload.environment,
-        deployment_version=payload.deployment_version,
-        worker_instances=payload.worker_instances,
-        data_generators=payload.data_generators,
-        timeout_seconds=payload.timeout_seconds,
-        selected_test_ids=tuple(payload.selected_test_ids),
-        failure_simulation=payload.failure_simulation,
-    )
+    try:
+        config = RunConfig(
+            environment=payload.environment,
+            deployment_version=payload.deployment_version,
+            worker_instances=payload.worker_instances,
+            data_generators=payload.data_generators,
+            timeout_seconds=payload.timeout_seconds,
+            selected_test_ids=tuple(payload.selected_test_ids),
+            failure_simulation=payload.failure_simulation,
+        )
+    except ValidationError as exc:
+        details = [
+            {"field": ".".join(str(p) for p in err["loc"]), "message": err["msg"]}
+            for err in exc.errors()
+        ]
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail={"error": "Invalid run configuration", "details": details},
+        ) from exc
     try:
         run = await svc.create_run(config)
     except ValidationFailed as exc:
         raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={"error": "Invalid run configuration", "details": exc.errors},
         ) from exc
     return to_detail(run)
