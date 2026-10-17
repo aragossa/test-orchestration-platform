@@ -518,3 +518,10 @@ th.num {
 .test-row-detail.bad {
   color: var(--bad);
 }
+
+.dashboard-tests {
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

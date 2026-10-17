@@ -73,6 +73,7 @@ export function Dashboard() {
                 <th>Tests</th>
                 <th>Result</th>
                 <th>Started</th>
+                <th>Finished</th>
                 <th className="num">Duration</th>
               </tr>
             </thead>
@@ -113,6 +114,9 @@ function RunRow({ run, now, onOpen }: { run: RunSummary; now: number; onOpen: ()
         {run.is_terminal && executed < counts.total ? (
           <div className="small muted">{counts.total - executed} not executed</div>
         ) : null}
+        <div className="small muted mono dashboard-tests" title={run.selected_test_ids.join(", ")}>
+          {run.selected_test_ids.join(", ")}
+        </div>
       </td>
       <td>
         {run.final_result ?? <span className="muted">—</span>}
@@ -124,6 +128,9 @@ function RunRow({ run, now, onOpen }: { run: RunSummary; now: number; onOpen: ()
       </td>
       <td className="muted" title={run.started_at ?? run.created_at}>
         {formatTime(run.started_at ?? run.created_at)}
+      </td>
+      <td className="muted" title={run.finished_at ?? undefined}>
+        {formatTime(run.finished_at)}
       </td>
       <td className="num mono">
         {run.is_terminal
