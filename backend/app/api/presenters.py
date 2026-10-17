@@ -10,7 +10,7 @@ from app.api.schemas import (
     TestCounts,
     TransitionOut,
 )
-from app.domain.states import RunState, TestStatus, is_terminal
+from app.domain.states import FailureSimulation, RunState, TestStatus, is_terminal
 from app.persistence.models import Run
 
 
@@ -64,7 +64,7 @@ def to_summary(run: Run) -> RunSummaryOut:
         current_step=run.current_step,
         final_result=final_result(run, counts),
         error_message=run.error_message,
-        failure_simulation=run.failure_simulation,  # type: ignore[arg-type]
+        failure_simulation=FailureSimulation(run.failure_simulation),
         selected_test_ids=[t.test_id for t in run.tests],
         test_counts=counts,
         created_at=run.created_at,

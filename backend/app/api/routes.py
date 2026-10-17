@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import ValidationError
@@ -41,7 +41,7 @@ def service(session: SessionDep) -> RunService:
 
 ServiceDep = Annotated[RunService, Depends(service)]
 
-ERROR_RESPONSES = {
+ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     404: {"model": ErrorOut},
     409: {"model": ErrorOut},
     422: {"model": ErrorOut},

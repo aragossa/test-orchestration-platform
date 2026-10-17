@@ -231,7 +231,7 @@ class RunRepository:
         )
         result = await self.session.execute(stmt)
         await self.session.commit()
-        return result.rowcount or 0
+        return int(getattr(result, "rowcount", 0) or 0)
 
     async def request_cancel(self, run_id: int) -> None:
         await self.update_run(run_id, cancel_requested_at=utcnow())
