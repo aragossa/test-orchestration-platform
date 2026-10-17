@@ -525,3 +525,7 @@ th.num {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+td:first-child .mono {
+  white-space: nowrap;
+}
