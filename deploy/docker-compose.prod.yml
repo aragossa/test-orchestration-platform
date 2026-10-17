@@ -1,0 +1,59 @@
+# Production stack for a single VPS: Caddy (TLS) -> app (API + worker) -> Postgres.
+# Usage on the server, from the directory holding this file and a .env:
+#   docker compose -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.prod.yml up -d
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-orchestrator}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-orchestrator}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-orchestrator} -d ${POSTGRES_DB:-orchestrator}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    image: ${APP_IMAGE:-ghcr.io/OWNER/test-orchestration-platform:latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-orchestrator}
+      WORKER_ID: ${WORKER_ID:-vps-1}
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      MOCK_PREPARE_DELAY_MS: ${MOCK_PREPARE_DELAY_MS:-2000}
+      MOCK_DEPLOY_DELAY_MS: ${MOCK_DEPLOY_DELAY_MS:-3000}
+      MOCK_READY_DELAY_MS: ${MOCK_READY_DELAY_MS:-2000}
+      MOCK_TEST_DELAY_SCALE: ${MOCK_TEST_DELAY_SCALE:-1.0}
+      MOCK_RANDOM_FAILURE_RATE: ${MOCK_RANDOM_FAILURE_RATE:-0}
+    expose:
+      - "8000"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in .env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  db-data:
+  caddy-data:
+  caddy-config:
