@@ -1,0 +1,40 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run pytest *)",
+      "Bash(uv run ruff *)",
+      "Bash(uv run mypy *)",
+      "Bash(npm run lint)",
+      "Bash(npm run build)"
+    ],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(ssh *)",
+      "Bash(scp *)",
+      "Bash(rsync *)",
+      "Bash(docker compose -f deploy/docker-compose.prod.yml *)",
+      "Bash(gh secret *)",
+      "Bash(gh workflow *)",
+      "Bash(gh release *)"
+    ],
+    "deny": [
+      "Read(./**/.env)",
+      "Edit(./**/.env)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_response.filePath // .tool_input.file_path'); case \"$f\" in \"$CLAUDE_PROJECT_DIR\"/backend/*.py) uv run --quiet --directory \"$CLAUDE_PROJECT_DIR/backend\" ruff format \"$f\" && uv run --quiet --directory \"$CLAUDE_PROJECT_DIR/backend\" ruff check --fix \"$f\";; esac >/dev/null 2>&1 || true",
+            "timeout": 30,
+            "statusMessage": "ruff format + fix"
+          }
+        ]
+      }
+    ]
+  }
+}
