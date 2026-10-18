@@ -20,7 +20,7 @@ services:
       retries: 20
 
   app:
-    image: ${APP_IMAGE:-ghcr.io/OWNER/test-orchestration-platform:latest}
+    image: ${APP_IMAGE:-ghcr.io/aragossa/test-orchestration-platform:latest}
     command: ["api"]
     restart: unless-stopped
     depends_on:
@@ -40,7 +40,7 @@ services:
       retries: 3
 
   worker:
-    image: ${APP_IMAGE:-ghcr.io/OWNER/test-orchestration-platform:latest}
+    image: ${APP_IMAGE:-ghcr.io/aragossa/test-orchestration-platform:latest}
     command: ["worker"]
     restart: unless-stopped
     depends_on:

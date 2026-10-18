@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-time bootstrap for a fresh Ubuntu 24.04 VPS. Run as root:
-#   curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/deploy/server-setup.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/aragossa/test-orchestration-platform/main/deploy/server-setup.sh | bash
 # Then put docker-compose.prod.yml, Caddyfile and .env into /opt/orchestrator.
 set -euo pipefail
 
