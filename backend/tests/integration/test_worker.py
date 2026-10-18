@@ -8,12 +8,14 @@ from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import update
 
+from app.config import Settings
 from app.domain.states import RunState, TestStatus
 from app.orchestration.worker import Worker
 from app.persistence.db import Database
 from app.persistence.models import Run, RunTest
-from app.persistence.repository import RunRepository
+from app.persistence.repository import RunRepository, WorkerRepository
 from app.services import RunService
+from app.worker_service import serve
 from tests.conftest import GateInfrastructure, SpyTestRunner, eventually, make_config
 
 
@@ -278,3 +280,67 @@ async def test_run_tests_rows_are_isolated_per_run(
         rows = (await session.execute(RunTest.__table__.select())).all()
     by_run = {row.run_id: row.test_id for row in rows}
     assert by_run == {a: "connectivity_check", b: "high_load_processing"}
+
+
+async def alive_ids(db: Database, stale_after: int = 15) -> list[str]:
+    async with db.session() as session:
+        return [w.worker_id for w in await WorkerRepository(session).list_alive(stale_after)]
+
+
+async def test_heartbeat_marks_worker_alive_until_it_stops_or_goes_stale(
+    db: Database, make_worker: Callable[..., Worker]
+) -> None:
+    worker = make_worker(worker_id="w-1")
+    assert await alive_ids(db) == []
+
+    await worker.tick()
+    assert await alive_ids(db) == ["w-1"]
+    # A heartbeat older than the lease window means the process is gone.
+    assert await alive_ids(db, stale_after=0) == []
+
+    await worker.stop()
+    assert await alive_ids(db) == []
+
+    # Coming back after a crash or restart revives the same row.
+    await worker.tick()
+    assert await alive_ids(db) == ["w-1"]
+
+
+async def test_live_workers_report_the_runs_they_own(
+    db: Database, make_worker: Callable[..., Worker]
+) -> None:
+    infrastructure = GateInfrastructure()
+    worker = make_worker(infrastructure=infrastructure, worker_id="w-busy")
+    run_id = await create(db)
+    await worker.tick()
+    await infrastructure.entered.wait()
+
+    async with db.session() as session:
+        (status,) = await WorkerRepository(session).list_alive(15)
+    assert status.worker_id == "w-busy"
+    assert status.active_runs == 1
+    assert status.concurrency == 4
+
+    infrastructure.gate.set()
+    await worker.wait_idle()
+    assert await state_of(db, run_id) == RunState.COMPLETED
+
+
+async def test_worker_service_runs_until_stopped(db: Database, test_settings: Settings) -> None:
+    """The standalone process: starts a worker, executes queued runs, records
+    its shutdown when asked to stop."""
+    settings = test_settings.model_copy(update={"worker_id": "svc-1"})
+    stop = asyncio.Event()
+    task = asyncio.create_task(serve(settings, stop, database=db))
+    run_id = await create(db)
+    try:
+        await eventually(lambda: _is(db, run_id, RunState.COMPLETED))
+        assert await alive_ids(db) == ["svc-1"]
+    finally:
+        stop.set()
+        await asyncio.wait_for(task, timeout=5)
+    assert await alive_ids(db) == []
+
+
+async def _is(db: Database, run_id: int, state: str) -> bool:
+    return await state_of(db, run_id) == state

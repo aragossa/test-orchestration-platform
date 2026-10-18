@@ -35,17 +35,24 @@ Requirements: Docker, [uv](https://docs.astral.sh/uv/), Node 22.
 # 1. Database
 docker compose up -d db
 
-# 2. Backend (migrations + API + worker) on http://127.0.0.1:8000
+# 2. API (migrations + HTTP) on http://127.0.0.1:8000
 cd backend
 uv sync
 uv run alembic upgrade head
 uv run uvicorn app.main:app --reload
 
-# 3. Frontend on http://localhost:5173 (proxies /api to the backend)
+# 3. Worker, in a second terminal (this is what executes runs)
+cd backend
+uv run python -m app.worker_service
+
+# 4. Frontend on http://localhost:5173 (proxies /api to the backend)
 cd ../frontend
 npm ci
 npm run dev
 ```
+
+Without the worker the API still accepts runs, they just stay `PENDING`; the
+header of the UI then says "degraded: no workers alive".
 
 Or run the production image locally, exactly as deployed:
 
@@ -83,8 +90,8 @@ test. Tip: set the timeout to 5–10 s in the form, otherwise you wait for the
 environment default (60 s / 120 s). The form warns about this.
 
 **D. Persistence.** Complete a run, refresh the browser, restart the backend
-(`docker compose -f deploy/docker-compose.prod.yml restart app`), and the
-history is intact. If you restart *during* a run, see
+(`docker compose -f deploy/docker-compose.prod.yml restart app worker`), and
+the history is intact. If you restart the worker *during* a run, see
 [Backend restart and recovery](#backend-restart-and-recovery): the run
 continues from the step it was on.
 
@@ -99,30 +106,38 @@ runs after a restart.
  Browser (React SPA, polls /api every 1 s)
     │
     ▼
- FastAPI ── api/routes.py ── services.py ──┐
-    │                                      │ reads / writes
-    │ lifespan starts                      ▼
-    ▼                                PostgreSQL  ◄──── single source of truth
- Worker (asyncio task)                     ▲
-    │  claims PENDING runs, renews lease   │ every transition, event, result
-    ▼                                      │
- RunExecutor ── one step per state ────────┘
+ API process: FastAPI ── api/routes.py ── services.py
+    │  reads / writes runs, reads worker heartbeats
+    ▼
+ PostgreSQL  ◄──── single source of truth: every transition, event, result,
+    ▲               and the queue itself (runs in PENDING)
+    │  claims PENDING runs, renews leases, writes its heartbeat
+ Worker process: app.worker_service ── Worker (polling loop)
+    │
+    ▼
+ RunExecutor ── one step per state
     │
     ├── InfrastructureAdapter ──► MockInfrastructureAdapter
     └── TestExecutionAdapter  ──► MockTestExecutionAdapter
 ```
+
+The API and the worker are two processes built from one image (`deploy/entrypoint.sh
+api|worker`). They never talk to each other: the API writes a run into the
+database, the worker finds it there. Either side can restart or scale
+without the other noticing.
 
 Backend packages (`backend/app`):
 
 | Package | Responsibility |
 |---|---|
 | `domain/` | Pure Python, no I/O. `states.py` defines the run states, the legal transitions and `assert_transition`; `config.py` is the validated, frozen `RunConfig` that is snapshotted into every run. |
-| `persistence/` | SQLAlchemy models, Alembic migrations, seed data and `RunRepository`, the only place that writes runs. |
-| `adapters/` | The two `Protocol` interfaces and their mock implementations. |
-| `orchestration/` | `RunExecutor` executes one run step by step; `Worker` is the polling loop that claims runs, keeps leases alive and recovers after restarts. |
+| `persistence/` | SQLAlchemy models, Alembic migrations, seed data, `RunRepository` (the only place that writes runs) and `WorkerRepository` (worker heartbeats). |
+| `adapters/` | The two `Protocol` interfaces, their mock implementations and `build_adapters`, the one place that picks the concrete ones. |
+| `orchestration/` | `RunExecutor` executes one run step by step; `Worker` is the polling loop that claims runs, keeps leases alive, heartbeats and recovers after restarts. |
 | `services.py` | Use cases behind the API (create, list, cancel, update environment defaults). |
 | `api/` | Routes, request/response schemas and presenters. No business logic. |
-| `main.py` | Wires settings, database, adapters and worker together. |
+| `main.py` | The API process: wires settings and database into FastAPI. Starts no worker. |
+| `worker_service.py` | The worker process: wires settings, database and adapters into `Worker`, stops on `SIGTERM`; `--check` is its container health check. |
 
 The frontend (`frontend/src`) has three pages: `Dashboard` (recent runs with
 environment/status filters), `NewRun` (environment defaults loaded from the
@@ -165,7 +180,7 @@ which is what makes resumption possible.
 
 ## Persistence
 
-Six tables (see `backend/alembic/versions/`):
+Seven tables (see `backend/alembic/versions/`):
 
 | Table | Holds |
 |---|---|
@@ -175,6 +190,7 @@ Six tables (see `backend/alembic/versions/`):
 | `run_tests` | One row per selected test: status (`PENDING`, `RUNNING`, `PASSED`, `FAILED`, `TIMED_OUT`, `SKIPPED`), duration, message, error, timestamps. Created up front so "not executed" is visible. |
 | `run_transitions` | Full state history. |
 | `run_events` | Human-readable timeline ("Deployment started: stable", "Connectivity Check passed (2.0s)"), with level and optional payload. |
+| `workers` | One row per worker process: `concurrency`, `started_at`, `last_heartbeat_at`, `stopped_at`. Upserted on every scheduling pass; `/api/health` counts the rows whose heartbeat is younger than the lease window. |
 
 The configuration snapshot is immutable by construction: the run stores a
 copy, not a reference, so changing an environment's defaults later cannot
@@ -208,8 +224,9 @@ A run is `COMPLETED` only if every selected test is `PASSED`.
 
 ## Backend restart and recovery
 
-The worker lives inside the API process, so a restart of the container kills
-in-flight coroutines. What makes this safe:
+A restart of the API process changes nothing for runs: it executes none. A
+restart of the worker process kills in-flight coroutines. What makes this
+safe:
 
 1. **The database is the queue and the journal.** A run's `state` says which
    step was in progress; `run_tests.status` says which tests are done.
@@ -220,8 +237,8 @@ in-flight coroutines. What makes this safe:
    active run whose lease has expired *or* whose `worker_id` equals its own
    (the deployment uses a stable `WORKER_ID`, so the restarted container takes
    its own runs back immediately rather than after 15 s). Each tick also
-   reclaims expired leases, which covers a second instance taking over from a
-   dead one.
+   reclaims expired leases, which covers a second worker taking over from a
+   dead one, or a new worker taking over from an old one after a redeploy.
 4. **Resumption.** `RunExecutor.execute` is entered with the run already in an
    active state. It records a warning event (`Run resumed from RUNNING_TESTS
    after backend restart`) and re-runs the step for that state:
@@ -234,7 +251,7 @@ in-flight coroutines. What makes this safe:
    the executor re-raises `CancelledError` without touching the row, so the
    lease simply lapses and the next worker continues.
 
-This was verified by sending `SIGKILL` to the app container in the middle of
+This was verified by sending `SIGKILL` to the worker container in the middle of
 `RUNNING_TESTS` and restarting it: the already-passed test was not re-run, the
 interrupted one was, and the run finished `COMPLETED` with the resume event in
 its history (`tests/integration/test_worker.py` covers the same paths).
@@ -243,13 +260,21 @@ If a run cannot be resumed (for example its state is active but the step
 handler raises), it is marked `FAILED` with a reason instead of being left
 active forever.
 
+If *no* worker is running, queued runs wait in `PENDING` and active ones keep
+their last state until a worker appears; nothing pretends to progress. This
+is visible: `/api/health` reports `degraded` with an empty `workers` list,
+the UI header says "no workers alive", and the deploy workflow refuses to
+report success until a heartbeat is fresh.
+
 ## Concurrency and environment locking
 
-- The worker runs up to `WORKER_CONCURRENCY` (default 4) runs at once as
+- A worker runs up to `WORKER_CONCURRENCY` (default 4) runs at once as
   independent asyncio tasks. Each step uses its own short-lived database
   session, so no transaction stays open while waiting on an adapter.
-- Claiming uses `SELECT ... FOR UPDATE SKIP LOCKED` so multiple worker
-  processes could poll the same table without double-claiming.
+- Claiming uses `SELECT ... FOR UPDATE SKIP LOCKED`, so several worker
+  processes poll the same table without double-claiming:
+  `docker compose up -d --scale worker=3` works as is. Leave `WORKER_ID`
+  empty when scaling; each container then identifies itself by hostname.
 - A partial unique index `uq_runs_one_active_per_environment ON runs
   (environment_id) WHERE state IN (PREPARING, …, COLLECTING_RESULTS)` makes
   "one active deployment per environment" a database guarantee. The claim
@@ -300,7 +325,7 @@ All endpoints are under `/api`; interactive docs at `/api/docs`.
 | `GET` | `/runs?environment=&state=&limit=&offset=` | Dashboard list, newest first |
 | `GET` | `/runs/{id}` | Full detail: config, state, tests, transitions, events |
 | `POST` | `/runs/{id}/cancel` | Cancel a queued or active run (`409` if terminal) |
-| `GET` | `/health` | Database and worker status |
+| `GET` | `/health` | Database status and the list of live workers (`ok` needs both) |
 
 Validation happens on the backend in two layers: Pydantic field constraints
 (ranges, required fields, enum values, no duplicate tests, unknown fields
@@ -312,7 +337,7 @@ the backend is authoritative.
 
 ```bash
 cd backend
-uv run pytest            # 73 tests, ~20 s, needs the docker-compose database
+uv run pytest            # 76 tests, ~15 s, needs the docker-compose database
 uv run ruff check . && uv run mypy app
 ```
 
@@ -325,9 +350,11 @@ uv run ruff check . && uv run mypy app
   timeout, unexpected exceptions.
 - `tests/integration/test_worker.py` — concurrency across environments,
   queueing on a busy environment, cancellation (queued, mid-step and
-  mid-test), lost leases, and three restart/resume scenarios.
+  mid-test), lost leases, three restart/resume scenarios, heartbeats and the
+  standalone worker process (`app.worker_service`).
 - `tests/integration/test_api.py` — the HTTP contract, validation errors,
-  snapshot immutability, filters and pagination.
+  snapshot immutability, filters, pagination, and `/health` turning `ok`
+  only while a worker heartbeats.
 
 Tests run against a real PostgreSQL (`orchestrator_test`, created
 automatically) because the guarantees under test are PostgreSQL features. CI
@@ -337,24 +364,31 @@ build and a Docker build on every push.
 ## Deployment
 
 - `Dockerfile` builds the frontend with Node, then installs the backend with
-  uv into a slim Python image that serves the static files and runs the
-  worker. `deploy/entrypoint.sh` applies migrations before starting uvicorn.
-- `deploy/docker-compose.prod.yml` runs PostgreSQL (named volume), the app and
-  Caddy, which terminates TLS with an automatic Let's Encrypt certificate for
-  `DOMAIN`. Only ports 80/443 are published; the database is internal.
+  uv into a slim Python image. `deploy/entrypoint.sh api` applies migrations
+  and starts uvicorn, which also serves the static frontend;
+  `deploy/entrypoint.sh worker` starts `app.worker_service`.
+- `deploy/docker-compose.prod.yml` runs PostgreSQL (named volume), `app`
+  (API), `worker` and Caddy, which terminates TLS with an automatic Let's
+  Encrypt certificate for `DOMAIN`. Only ports 80/443 are published; the
+  database is internal. `worker` waits for `app` to be healthy so migrations
+  are applied before it starts; its own health check is
+  `python -m app.worker_service --check`, which passes while the worker's
+  heartbeat row is fresh.
 - `deploy/server-setup.sh` bootstraps a fresh Ubuntu VPS: Docker, firewall
   (SSH + 80/443), a `deploy` user.
 - `.github/workflows/deploy.yml` runs after CI succeeds on `main`: builds and
   pushes the image to GHCR, copies the compose files to the server over SSH,
-  pulls, restarts and waits for `/api/health`. Secrets: `DEPLOY_HOST`,
-  `DEPLOY_USER`, `DEPLOY_SSH_KEY`.
+  pulls, restarts and waits for `/api/health` to report `ok`, which requires
+  a live worker. Secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY`.
 
 ## Known limitations and trade-offs
 
-- **Worker in the API process.** One deployable unit instead of API + queue +
-  worker. It is enough for this scale and the lease mechanism already allows
-  several replicas, but a very busy API and the worker would compete for the
-  same event loop.
+- **The queue is a table.** The API and the worker share nothing but
+  PostgreSQL, which is also the queue. Fine at this scale and it keeps one
+  source of truth, but at a much higher run rate the claim query would
+  become the bottleneck.
+- **One worker in the deployed stack.** The protocol supports several
+  (`--scale worker=N`), the single VPS runs one.
 - **Polling, not push.** The worker polls the database every second and the
   UI polls the API every second. Simple and robust; `LISTEN/NOTIFY` or SSE
   would cut latency and load.
@@ -376,9 +410,10 @@ build and a Docker build on every push.
 
 ## What I would change for production
 
-- **Queue and workers as separate deployables** (same claim/lease protocol,
-  or a broker such as Redis Streams / SQS) so the API scales independently and
-  worker crashes do not affect request handling.
+- **Several workers, and a broker if the run rate demands it** (Redis Streams
+  / SQS carrying only "work is available", PostgreSQL staying the source of
+  truth; or `LISTEN/NOTIFY` to replace polling). The claim/lease protocol
+  stays the same.
 - **Idempotency keys for infrastructure operations** and a reconciliation
   loop that compares desired vs. actual state after a restart instead of
   blindly redoing steps.

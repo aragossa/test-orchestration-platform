@@ -36,7 +36,15 @@ TEST_URL = os.environ.get(
     f"postgresql+asyncpg://orchestrator:orchestrator@localhost:5432/{TEST_DB_NAME}",
 )
 
-TABLES = ["run_events", "run_transitions", "run_tests", "runs", "test_definitions", "environments"]
+TABLES = [
+    "workers",
+    "run_events",
+    "run_transitions",
+    "run_tests",
+    "runs",
+    "test_definitions",
+    "environments",
+]
 
 
 async def _ensure_test_database() -> None:
@@ -53,7 +61,6 @@ async def _ensure_test_database() -> None:
 def test_settings() -> Settings:
     return Settings(
         database_url=TEST_URL,
-        worker_enabled=True,
         worker_id="test-worker",
         worker_poll_interval_ms=50,
         worker_concurrency=4,

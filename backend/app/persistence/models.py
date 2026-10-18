@@ -57,6 +57,23 @@ class TestDefinition(Base):
     sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
 
+class WorkerRecord(Base):
+    """Liveness record of one worker process.
+
+    The worker upserts its row on every scheduling pass; the API reads the
+    table to report how many workers are alive. A row whose heartbeat is
+    older than the lease window, or whose `stopped_at` is set, is dead.
+    """
+
+    __tablename__ = "workers"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    concurrency: Mapped[int] = mapped_column(Integer, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    last_heartbeat_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    stopped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class Run(Base):
     __tablename__ = "runs"
     __table_args__ = (

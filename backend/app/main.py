@@ -1,8 +1,8 @@
 """FastAPI application factory.
 
-Wires the database, the mock adapters and the background worker together.
-Everything the orchestration engine needs is injected here, so a real
-infrastructure or test-runner adapter only needs to be swapped in this file.
+The API process serves HTTP and the built frontend; it does not execute runs.
+Execution happens in the separate worker process (`app.worker_service`), and
+the two share nothing but the database.
 """
 
 from __future__ import annotations
@@ -19,30 +19,12 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.adapters import MockInfrastructureAdapter, MockTestExecutionAdapter
 from app.api.routes import router
 from app.config import Settings, get_settings
-from app.orchestration.worker import Worker
 from app.persistence.db import Database
 from app.persistence.seed import seed_reference_data
 
 log = logging.getLogger(__name__)
-
-
-def build_adapters(
-    settings: Settings,
-) -> tuple[MockInfrastructureAdapter, MockTestExecutionAdapter]:
-    infrastructure = MockInfrastructureAdapter(
-        prepare_delay_ms=settings.mock_prepare_delay_ms,
-        deploy_delay_ms=settings.mock_deploy_delay_ms,
-        ready_delay_ms=settings.mock_ready_delay_ms,
-        random_failure_rate=settings.mock_random_failure_rate,
-    )
-    test_runner = MockTestExecutionAdapter(
-        delay_scale=settings.mock_test_delay_scale,
-        random_failure_rate=settings.mock_random_failure_rate,
-    )
-    return infrastructure, test_runner
 
 
 def create_app(settings: Settings | None = None, database: Database | None = None) -> FastAPI:
@@ -54,19 +36,9 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         app.state.db = db
         async with db.session() as session:
             await seed_reference_data(session)
-
-        worker: Worker | None = None
-        if settings.worker_enabled:
-            infrastructure, test_runner = build_adapters(settings)
-            worker = Worker(db, settings, infrastructure, test_runner)
-            await worker.start()
-            log.info("orchestration worker %s started", worker.worker_id)
-        app.state.worker = worker
         try:
             yield
         finally:
-            if worker:
-                await worker.stop()
             if database is None:
                 await db.dispose()
 
@@ -78,7 +50,6 @@ def create_app(settings: Settings | None = None, database: Database | None = Non
         openapi_url="/api/openapi.json",
     )
     app.state.settings = settings
-    app.state.worker = None
 
     if settings.cors_origins:
         app.add_middleware(

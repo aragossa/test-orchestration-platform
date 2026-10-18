@@ -19,9 +19,11 @@ from app.api.schemas import (
     RunDetailOut,
     RunListOut,
     TestDefinitionOut,
+    WorkerOut,
 )
 from app.domain.config import RunConfig
 from app.domain.states import RunState
+from app.persistence.repository import WorkerRepository
 from app.services import Conflict, EnvironmentDefaults, NotFound, RunService, ValidationFailed
 
 router = APIRouter(prefix="/api")
@@ -163,17 +165,21 @@ async def cancel_run(run_id: int, svc: ServiceDep) -> RunDetailOut:
 
 @router.get("/health", response_model=HealthOut)
 async def health(request: Request, session: SessionDep) -> HealthOut:
+    """`ok` needs a reachable database and at least one live worker. Workers
+    run in their own processes, so liveness comes from their heartbeat rows:
+    a heartbeat older than the lease window means the worker is gone."""
+    workers: list[WorkerOut] = []
     try:
         await session.execute(text("SELECT 1"))
         database = "ok"
+        stale_after = request.app.state.settings.worker_lease_seconds
+        alive = await WorkerRepository(session).list_alive(stale_after)
+        workers = [WorkerOut(**vars(w)) for w in alive]
     except Exception as exc:  # noqa: BLE001
         database = f"error: {exc.__class__.__name__}"
-    worker = request.app.state.worker
-    worker_status = worker.status() if worker else {"running": False, "disabled": True}
-    healthy = database == "ok" and (worker is None or worker_status["running"])
     return HealthOut(
-        status="ok" if healthy else "degraded",
+        status="ok" if database == "ok" and workers else "degraded",
         database=database,
-        worker=worker_status,
+        workers=workers,
         version=__version__,
     )

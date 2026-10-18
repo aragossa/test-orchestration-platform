@@ -143,8 +143,16 @@ class ErrorOut(BaseModel):
     details: list[ErrorDetail] = []
 
 
+class WorkerOut(BaseModel):
+    worker_id: str
+    concurrency: int
+    active_runs: int
+    started_at: datetime
+    last_heartbeat_at: datetime
+
+
 class HealthOut(BaseModel):
     status: str
     database: str
-    worker: dict[str, Any]
+    workers: list[WorkerOut]
     version: str

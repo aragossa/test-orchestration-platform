@@ -1,8 +1,8 @@
-"""HTTP contract. The worker is disabled here; execution is covered elsewhere."""
+"""HTTP contract. No worker runs here (the API never starts one); execution is covered elsewhere."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
@@ -11,14 +11,14 @@ from httpx import ASGITransport, AsyncClient
 from app.config import Settings
 from app.domain.states import RunState
 from app.main import create_app
+from app.orchestration.worker import Worker
 from app.persistence.db import Database
 from app.persistence.repository import RunRepository
 
 
 @pytest.fixture
 async def client(db: Database, test_settings: Settings) -> AsyncIterator[AsyncClient]:
-    settings = test_settings.model_copy(update={"worker_enabled": False})
-    app = create_app(settings=settings, database=db)
+    app = create_app(settings=test_settings, database=db)
     async with app.router.lifespan_context(app):
         transport = ASGITransport(app=app)
         async with AsyncClient(transport=transport, base_url="http://test") as c:
@@ -183,8 +183,25 @@ async def test_cancel_queued_run_and_refuse_finished_run(client: AsyncClient, db
     assert (await client.post("/api/runs/404/cancel")).status_code == 404
 
 
-async def test_health_reports_database_and_worker(client: AsyncClient) -> None:
+async def test_health_reports_database_and_live_workers(
+    client: AsyncClient, make_worker: Callable[..., Worker]
+) -> None:
+    # No worker process has heartbeat yet: the database is fine but nobody executes runs.
     body = (await client.get("/api/health")).json()
     assert body["database"] == "ok"
-    assert body["worker"]["running"] is False  # disabled in this fixture
+    assert body["workers"] == []
+    assert body["status"] == "degraded"
     assert body["version"]
+
+    worker = make_worker(worker_id="worker-a")
+    await worker.tick()
+    body = (await client.get("/api/health")).json()
+    assert body["status"] == "ok"
+    assert [w["worker_id"] for w in body["workers"]] == ["worker-a"]
+    assert body["workers"][0]["active_runs"] == 0
+    assert body["workers"][0]["concurrency"] == 4
+
+    await worker.stop()
+    body = (await client.get("/api/health")).json()
+    assert body["status"] == "degraded"
+    assert body["workers"] == []

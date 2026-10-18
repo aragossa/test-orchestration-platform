@@ -1,4 +1,5 @@
-# Production stack for a single VPS: Caddy (TLS) -> app (API + worker) -> Postgres.
+# Production stack for a single VPS: Caddy (TLS) -> app (API) -> Postgres <- worker.
+# `app` and `worker` run the same image in different roles and share only the database.
 # Usage on the server, from the directory holding this file and a .env:
 #   docker compose -f docker-compose.prod.yml pull
 #   docker compose -f docker-compose.prod.yml up -d
@@ -20,21 +21,48 @@ services:
 
   app:
     image: ${APP_IMAGE:-ghcr.io/OWNER/test-orchestration-platform:latest}
+    command: ["api"]
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-orchestrator}
-      WORKER_ID: ${WORKER_ID:-vps-1}
+      WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-15}
+    expose:
+      - "8000"
+    healthcheck:
+      # Database reachable; worker liveness is reported in the body, not the code.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+  worker:
+    image: ${APP_IMAGE:-ghcr.io/OWNER/test-orchestration-platform:latest}
+    command: ["worker"]
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy   # migrations are applied by the API on start
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-orchestrator}
+      WORKER_ID: ${WORKER_ID:-}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+      WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-15}
       MOCK_PREPARE_DELAY_MS: ${MOCK_PREPARE_DELAY_MS:-2000}
       MOCK_DEPLOY_DELAY_MS: ${MOCK_DEPLOY_DELAY_MS:-3000}
       MOCK_READY_DELAY_MS: ${MOCK_READY_DELAY_MS:-2000}
       MOCK_TEST_DELAY_SCALE: ${MOCK_TEST_DELAY_SCALE:-1.0}
       MOCK_RANDOM_FAILURE_RATE: ${MOCK_RANDOM_FAILURE_RATE:-0}
-    expose:
-      - "8000"
+    healthcheck:
+      # Exits 0 while this worker's own heartbeat row is younger than the lease.
+      test: ["CMD", "python", "-m", "app.worker_service", "--check"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
   caddy:
     image: caddy:2-alpine

@@ -1,9 +1,11 @@
 """Background worker: claims runs from the database and executes them.
 
-The worker is a polling loop inside the API process. The database is the
-queue; `worker_id` and `lease_expires_at` on the run row record who is working
-on it and until when. A run whose lease lapses is considered abandoned and is
-picked up again, which is how execution survives a backend restart.
+The worker is a polling loop in its own process (`python -m app.worker_service`);
+it shares nothing with the API but the database. The database is the queue;
+`worker_id` and `lease_expires_at` on the run row record who is working on it
+and until when. A run whose lease lapses is considered abandoned and is picked
+up again, which is how execution survives a worker restart. Each pass also
+upserts the worker's own heartbeat row so the API can report who is alive.
 """
 
 from __future__ import annotations
@@ -17,7 +19,12 @@ from app.adapters.base import InfrastructureAdapter, TestExecutionAdapter
 from app.config import Settings
 from app.orchestration.executor import RunExecutor
 from app.persistence.db import Database
-from app.persistence.repository import RunRepository, default_worker_id, utcnow
+from app.persistence.repository import (
+    RunRepository,
+    WorkerRepository,
+    default_worker_id,
+    utcnow,
+)
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +64,11 @@ class Worker:
             task.cancel()
         await asyncio.gather(*self._tasks.values(), return_exceptions=True)
         self._tasks.clear()
+        try:
+            async with self.db.session() as session:
+                await WorkerRepository(session).mark_stopped(self.worker_id)
+        except Exception:  # noqa: BLE001
+            log.exception("worker %s: could not record shutdown", self.worker_id)
 
     def status(self) -> dict[str, Any]:
         return {
@@ -109,6 +121,10 @@ class Worker:
         """One scheduling pass. Returns the ids launched in this pass."""
         self.last_tick_at = utcnow()
         self._reap_finished()
+        async with self.db.session() as session:
+            await WorkerRepository(session).heartbeat(
+                self.worker_id, self.settings.worker_concurrency, self.started_at or utcnow()
+            )
         free = self.settings.worker_concurrency - len(self._tasks)
         if free <= 0:
             return []

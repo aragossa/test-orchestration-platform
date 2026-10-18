@@ -14,9 +14,8 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://orchestrator:orchestrator@localhost:5432/orchestrator"
     database_echo: bool = False
 
-    # Execution worker
-    worker_enabled: bool = True
-    worker_id: str | None = None  # defaults to hostname:pid
+    # Execution worker (the `app.worker_service` process; the API ignores these)
+    worker_id: str | None = None  # defaults to the hostname
     worker_poll_interval_ms: int = Field(default=1000, ge=10)
     worker_concurrency: int = Field(default=4, ge=1, le=64)
     worker_lease_seconds: int = Field(default=15, ge=1)

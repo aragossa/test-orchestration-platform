@@ -8,10 +8,12 @@ row still in the state we think it is?). Both must pass or nothing is written.
 from __future__ import annotations
 
 import socket
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,6 +33,7 @@ from app.persistence.models import (
     RunTest,
     RunTransition,
     TestDefinition,
+    WorkerRecord,
 )
 
 
@@ -51,6 +54,15 @@ class EnvironmentBusyError(Exception):
         self.run_id = run_id
         self.environment = environment
         super().__init__(f"Environment '{environment}' is busy; run {run_id} must wait")
+
+
+@dataclass(frozen=True)
+class WorkerStatus:
+    worker_id: str
+    concurrency: int
+    active_runs: int
+    started_at: datetime
+    last_heartbeat_at: datetime
 
 
 def utcnow() -> datetime:
@@ -344,3 +356,64 @@ class RunRepository:
         )
         await self.session.execute(stmt)
         await self.session.commit()
+
+
+class WorkerRepository:
+    """Liveness records in the `workers` table. Separate from runs on purpose:
+    a heartbeat says nothing about any run, it only says the process is up."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+
+    async def heartbeat(self, worker_id: str, concurrency: int, started_at: datetime) -> None:
+        now = utcnow()
+        stmt = pg_insert(WorkerRecord).values(
+            id=worker_id,
+            concurrency=concurrency,
+            started_at=started_at,
+            last_heartbeat_at=now,
+            stopped_at=None,
+        )
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[WorkerRecord.id],
+            set_={
+                "concurrency": concurrency,
+                "started_at": started_at,
+                "last_heartbeat_at": now,
+                "stopped_at": None,
+            },
+        )
+        await self.session.execute(stmt)
+        await self.session.commit()
+
+    async def mark_stopped(self, worker_id: str) -> None:
+        stmt = update(WorkerRecord).where(WorkerRecord.id == worker_id).values(stopped_at=utcnow())
+        await self.session.execute(stmt)
+        await self.session.commit()
+
+    async def list_alive(self, stale_after_seconds: int) -> list[WorkerStatus]:
+        """Workers that heartbeat within the window and did not stop gracefully,
+        with the number of active runs each one currently owns."""
+        cutoff = utcnow() - timedelta(seconds=stale_after_seconds)
+        active = (
+            select(Run.worker_id, func.count().label("n"))
+            .where(Run.state.in_(list(ACTIVE_STATES)))
+            .group_by(Run.worker_id)
+            .subquery()
+        )
+        stmt = (
+            select(WorkerRecord, func.coalesce(active.c.n, 0))
+            .outerjoin(active, active.c.worker_id == WorkerRecord.id)
+            .where(WorkerRecord.stopped_at.is_(None), WorkerRecord.last_heartbeat_at >= cutoff)
+            .order_by(WorkerRecord.id)
+        )
+        return [
+            WorkerStatus(
+                worker_id=record.id,
+                concurrency=record.concurrency,
+                active_runs=int(count),
+                started_at=record.started_at,
+                last_heartbeat_at=record.last_heartbeat_at,
+            )
+            for record, count in (await self.session.execute(stmt)).all()
+        ]

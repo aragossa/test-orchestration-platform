@@ -154,10 +154,18 @@ export interface RunCreate {
   failure_simulation: FailureSimulation;
 }
 
+export interface WorkerInfo {
+  worker_id: string;
+  concurrency: number;
+  active_runs: number;
+  started_at: string;
+  last_heartbeat_at: string;
+}
+
 export interface Health {
   status: string;
   database: string;
-  worker: { worker_id?: string; running: boolean; active_runs?: number[] };
+  workers: WorkerInfo[];
   version: string;
 }
 

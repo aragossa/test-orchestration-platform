@@ -1,5 +1,6 @@
-# Single image: the frontend is built with Node and served as static files by
-# the FastAPI backend, which also hosts the orchestration worker.
+# Single image, two roles (see deploy/entrypoint.sh): `api` serves the HTTP API
+# and the frontend built here; `worker` runs the orchestration loop. Health
+# checks are per role and live in the compose file.
 
 FROM node:22-alpine AS frontend
 WORKDIR /build
@@ -29,6 +30,5 @@ ENV PATH="/opt/venv/bin:$PATH" \
     STATIC_DIR=/app/static \
     CORS_ORIGINS='[]'
 EXPOSE 8000
-HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4).status == 200 else 1)"
 ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["api"]
