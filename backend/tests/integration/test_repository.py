@@ -123,3 +123,25 @@ async def test_reclaim_takes_only_expired_or_own_leases(db: Database) -> None:
         # extend_lease refuses to renew a lease the worker no longer owns.
         assert await repo.extend_lease(theirs, "worker-b", 60) is False
         assert await repo.extend_lease(theirs, "worker-a", 60) is True
+
+
+async def test_transitions_and_events_are_logged(
+    db: Database, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("INFO", logger="app.persistence.repository")
+    async with db.session() as session:
+        repo = RunRepository(session)
+        run = await repo.create_run(make_config())
+        await repo.transition(run.id, RunState.PENDING, RunState.PREPARING)
+        await repo.add_event(run.id, "Preparing environment")
+        await repo.add_event(run.id, "Lease lost", level="warning")
+        await repo.transition(
+            run.id, RunState.PREPARING, RunState.FAILED, reason="disk on fire", error_message="x"
+        )
+    messages = [(r.levelname, r.getMessage()) for r in caplog.records]
+    assert messages == [
+        ("INFO", f"run {run.id}: PENDING -> PREPARING"),
+        ("INFO", f"run {run.id}: Preparing environment"),
+        ("WARNING", f"run {run.id}: Lease lost"),
+        ("INFO", f"run {run.id}: PREPARING -> FAILED (disk on fire)"),
+    ]

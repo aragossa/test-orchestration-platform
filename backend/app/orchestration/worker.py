@@ -140,6 +140,10 @@ class Worker:
                 self.worker_id, self.settings.worker_lease_seconds, free - len(abandoned)
             )
             launched.extend(pending)
+        if pending:
+            log.info("worker %s: claimed run(s) %s", self.worker_id, pending)
+        if abandoned:
+            log.warning("worker %s: took over abandoned run(s) %s", self.worker_id, abandoned)
 
         for run_id in launched:
             self._launch(run_id)

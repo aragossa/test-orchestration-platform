@@ -192,6 +192,11 @@ Seven tables (see `backend/alembic/versions/`):
 | `run_events` | Human-readable timeline ("Deployment started: stable", "Connectivity Check passed (2.0s)"), with level and optional payload. |
 | `workers` | One row per worker process: `concurrency`, `started_at`, `last_heartbeat_at`, `stopped_at`. Upserted on every scheduling pass; `/api/health` counts the rows whose heartbeat is younger than the lease window. |
 
+Every transition and event is also written to the worker's log
+(`docker logs -f orchestrator-worker-1`): claims, `PENDING -> PREPARING`,
+"Connectivity Check passed (2.0s)", and so on, with the run id. The log is a
+convenience for operators; the database stays the source of truth.
+
 The configuration snapshot is immutable by construction: the run stores a
 copy, not a reference, so changing an environment's defaults later cannot
 affect it (covered by a test). Nothing about a run lives in process memory;
@@ -337,7 +342,7 @@ the backend is authoritative.
 
 ```bash
 cd backend
-uv run pytest            # 76 tests, ~15 s, needs the docker-compose database
+uv run pytest            # 77 tests, ~15 s, needs the docker-compose database
 uv run ruff check . && uv run mypy app
 ```
 

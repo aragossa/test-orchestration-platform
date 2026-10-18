@@ -7,6 +7,7 @@ row still in the state we think it is?). Both must pass or nothing is written.
 
 from __future__ import annotations
 
+import logging
 import socket
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -35,6 +36,8 @@ from app.persistence.models import (
     TestDefinition,
     WorkerRecord,
 )
+
+log = logging.getLogger(__name__)
 
 
 class StaleRunError(Exception):
@@ -210,6 +213,7 @@ class RunRepository:
             RunTransition(run_id=run_id, from_state=expected, to_state=target, reason=reason)
         )
         await self.session.commit()
+        log.info("run %s: %s -> %s%s", run_id, expected, target, f" ({reason})" if reason else "")
 
     async def update_run(self, run_id: int, **fields: Any) -> None:
         stmt = update(Run).where(Run.id == run_id).values(updated_at=utcnow(), **fields)
@@ -226,6 +230,12 @@ class RunRepository:
     ) -> None:
         self.session.add(RunEvent(run_id=run_id, level=level, message=message, payload=payload))
         await self.session.commit()
+        log.log(
+            logging.WARNING if level in ("warning", "error") else logging.INFO,
+            "run %s: %s",
+            run_id,
+            message,
+        )
 
     async def update_test(self, run_test_id: int, **fields: Any) -> None:
         stmt = update(RunTest).where(RunTest.id == run_test_id).values(**fields)
