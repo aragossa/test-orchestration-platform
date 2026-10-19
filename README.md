@@ -394,6 +394,10 @@ build and a Docker build on every push.
   become the bottleneck.
 - **One worker in the deployed stack.** The protocol supports several
   (`--scale worker=N`), the single VPS runs one.
+- **No load balancing between workers.** Each worker claims as many queued
+  runs as it has free slots on every tick, so with two workers the one whose
+  tick happens to fire first takes everything until it is full. `SKIP LOCKED`
+  guarantees that no run is claimed twice; it does not spread runs evenly.
 - **Polling, not push.** The worker polls the database every second and the
   UI polls the API every second. Simple and robust; `LISTEN/NOTIFY` or SSE
   would cut latency and load.
@@ -418,7 +422,12 @@ build and a Docker build on every push.
 - **Several workers, and a broker if the run rate demands it** (Redis Streams
   / SQS carrying only "work is available", PostgreSQL staying the source of
   truth; or `LISTEN/NOTIFY` to replace polling). The claim/lease protocol
-  stays the same.
+  stays the same. Worker count would be driven by an autoscaler on the
+  length of the `PENDING` queue (Kubernetes HPA on a custom metric, or
+  KEDA's PostgreSQL scaler), not by hand.
+- **Fair claiming**: at most one run per tick per worker, plus jitter on the
+  polling interval, so several workers share the queue instead of the fastest
+  one taking everything.
 - **Idempotency keys for infrastructure operations** and a reconciliation
   loop that compares desired vs. actual state after a restart instead of
   blindly redoing steps.
@@ -431,6 +440,12 @@ build and a Docker build on every push.
   storage and linked from the run.
 - **Environment model**: per-environment capacity (today: one active run),
   versions registry, per-test timeouts instead of one timeout per run.
+- **Test severity**: a `blocking` / `informational` flag on catalog tests, so
+  the verdict is computed over blocking tests only and a failed informational
+  test is reported ("3/3 blocking passed, 1 informational failed") without
+  failing the run; plus an opt-in fail-fast switch per run. Today every test
+  is blocking and the run always continues past a failure, as the assignment
+  requires.
 - **Operations**: authentication (OIDC), audit of who started/cancelled what,
   metrics (run durations, failure rates by test), structured logs with run
   id, alerting on stuck runs, database backups and migrations run as a
