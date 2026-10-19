@@ -374,12 +374,14 @@ build and a Docker build on every push.
   and starts uvicorn, which also serves the static frontend;
   `deploy/entrypoint.sh worker` starts `app.worker_service`.
 - `deploy/docker-compose.prod.yml` runs PostgreSQL (named volume), `app`
-  (API), `worker` and Caddy, which terminates TLS with an automatic Let's
-  Encrypt certificate for `DOMAIN`. Only ports 80/443 are published; the
-  database is internal. `worker` waits for `app` to be healthy so migrations
-  are applied before it starts; its own health check is
-  `python -m app.worker_service --check`, which passes while the worker's
-  heartbeat row is fresh.
+  (API), two `worker` replicas and Caddy, which terminates TLS with an
+  automatic Let's Encrypt certificate for `DOMAIN`. Only ports 80/443 are
+  published; the database is internal. `WORKER_ID` is left empty, so each
+  replica identifies itself by its container hostname (visible in
+  `/api/health` and in the "Run started on worker …" event). `worker` waits
+  for `app` to be healthy so migrations are applied before it starts; its
+  own health check is `python -m app.worker_service --check`, which passes
+  while the worker's heartbeat row is fresh.
 - `deploy/server-setup.sh` bootstraps a fresh Ubuntu VPS: Docker, firewall
   (SSH + 80/443), a `deploy` user.
 - `.github/workflows/deploy.yml` runs after CI succeeds on `main`: builds and
