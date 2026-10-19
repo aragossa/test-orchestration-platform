@@ -240,8 +240,9 @@ safe:
    every 5 s while the run executes.
 3. **Recovery on startup.** `Worker._recover_on_startup` reclaims every
    active run whose lease has expired *or* whose `worker_id` equals its own
-   (the deployment uses a stable `WORKER_ID`, so the restarted container takes
-   its own runs back immediately rather than after 15 s). Each tick also
+   (the id is the container hostname, which survives a restart, so a
+   restarted container takes its own runs back immediately rather than
+   after 15 s). Each tick also
    reclaims expired leases, which covers a second worker taking over from a
    dead one, or a new worker taking over from an old one after a redeploy.
 4. **Resumption.** `RunExecutor.execute` is entered with the run already in an
@@ -304,7 +305,7 @@ class TestExecutionAdapter(Protocol):
 ```
 
 The engine depends only on these protocols; the concrete classes are chosen in
-`main.build_adapters`. The mocks sleep for configurable delays and implement
+`adapters.build_adapters`. The mocks sleep for configurable delays and implement
 the four failure scenarios. Fault injection is interpreted *inside* the
 adapters (they read `config.failure_simulation`), so the orchestrator contains
 no scenario-specific branches: it only sees exceptions, results and timeouts,
@@ -392,8 +393,8 @@ build and a Docker build on every push.
   PostgreSQL, which is also the queue. Fine at this scale and it keeps one
   source of truth, but at a much higher run rate the claim query would
   become the bottleneck.
-- **One worker in the deployed stack.** The protocol supports several
-  (`--scale worker=N`), the single VPS runs one.
+- **Two workers on one VPS.** The deployed stack runs two worker replicas
+  (`deploy.replicas: 2`) on the same host, so they share its failure domain.
 - **No load balancing between workers.** Each worker claims as many queued
   runs as it has free slots on every tick, so with two workers the one whose
   tick happens to fire first takes everything until it is full. `SKIP LOCKED`
@@ -440,12 +441,8 @@ build and a Docker build on every push.
   storage and linked from the run.
 - **Environment model**: per-environment capacity (today: one active run),
   versions registry, per-test timeouts instead of one timeout per run.
-- **Test severity**: a `blocking` / `informational` flag on catalog tests, so
-  the verdict is computed over blocking tests only and a failed informational
-  test is reported ("3/3 blocking passed, 1 informational failed") without
-  failing the run; plus an opt-in fail-fast switch per run. Today every test
-  is blocking and the run always continues past a failure, as the assignment
-  requires.
+- **Test severity**: blocking vs. informational tests, plus an opt-in
+  fail-fast switch per run.
 - **Operations**: authentication (OIDC), audit of who started/cancelled what,
   metrics (run durations, failure rates by test), structured logs with run
   id, alerting on stuck runs, database backups and migrations run as a
@@ -456,5 +453,4 @@ build and a Docker build on every push.
 ## Time spent
 
 Roughly 10 hours including the deployment and this document, with AI-assisted
-development tooling used throughout. All architecture and implementation
-decisions are mine and I am happy to walk through any part of it.
+development tooling used throughout. I am happy to walk through any part of it.
