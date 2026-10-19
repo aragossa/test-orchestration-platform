@@ -41,6 +41,8 @@ services:
 
   worker:
     image: ${APP_IMAGE:-ghcr.io/aragossa/test-orchestration-platform:latest}
+    deploy:
+      replicas: 2
     command: ["worker"]
     restart: unless-stopped
     depends_on:
