@@ -205,3 +205,90 @@ async def test_health_reports_database_and_live_workers(
     body = (await client.get("/api/health")).json()
     assert body["status"] == "degraded"
     assert body["workers"] == []
+
+
+# ------------------------------------------------- what the UI sees at the end
+
+
+async def _run_to_the_end(
+    client: AsyncClient, make_worker: Callable[..., Worker], **overrides: Any
+) -> dict[str, Any]:
+    """Create a run through the API, let a worker execute it, read it back."""
+    run_id = (await client.post("/api/runs", json=payload(**overrides))).json()["id"]
+    worker = make_worker()
+    await worker.tick()
+    await worker.wait_idle()
+    await worker.stop()
+    body = (await client.get(f"/api/runs/{run_id}")).json()
+    assert body["is_terminal"] is True
+    assert body["worker_id"] is None and body["current_step"] is None
+    assert isinstance(body["duration_seconds"], float) and body["duration_seconds"] >= 0
+    assert body["started_at"] and body["finished_at"]
+    summary = next(r for r in (await client.get("/api/runs")).json()["items"] if r["id"] == run_id)
+    assert summary["final_result"] == body["final_result"]
+    assert summary["state"] == body["state"]
+    return body
+
+
+async def test_completed_run_is_presented_with_its_result(
+    client: AsyncClient, make_worker: Callable[..., Worker]
+) -> None:
+    body = await _run_to_the_end(client, make_worker)
+    assert body["state"] == "COMPLETED"
+    assert body["final_result"] == "3/3 tests passed"
+    assert body["error_message"] is None
+    assert body["deployment_id"].startswith("dep-")
+    assert body["test_counts"] == {
+        "total": 3,
+        "passed": 3,
+        "failed": 0,
+        "timed_out": 0,
+        "skipped": 0,
+        "pending": 0,
+    }
+    assert [t["status"] for t in body["tests"]] == ["PASSED"] * 3
+    assert all(
+        t["duration_ms"] >= 0 and t["started_at"] and t["finished_at"] for t in body["tests"]
+    )
+    assert body["tests"][0]["name"] == "Connectivity Check"
+    assert [t["to_state"] for t in body["transitions"]][-2:] == ["COLLECTING_RESULTS", "COMPLETED"]
+
+
+async def test_deployment_failure_is_presented_as_failed_before_tests(
+    client: AsyncClient, make_worker: Callable[..., Worker]
+) -> None:
+    body = await _run_to_the_end(client, make_worker, failure_simulation="deployment_failure")
+    assert body["state"] == "FAILED"
+    assert body["final_result"] == "Failed before tests ran"
+    assert "Simulated deployment failure" in body["error_message"]
+    assert body["deployment_id"] is None
+    assert body["test_counts"]["skipped"] == 3 and body["test_counts"]["pending"] == 0
+    assert [t["status"] for t in body["tests"]] == ["SKIPPED"] * 3
+    assert all(t["message"] == "Skipped: run failed before execution" for t in body["tests"])
+    assert body["transitions"][-1]["from_state"] == "DEPLOYING"
+    assert any(
+        e["level"] == "error" and "Run failed during DEPLOYING" in e["message"]
+        for e in body["events"]
+    )
+
+
+async def test_test_failure_and_timeout_are_presented_per_test(
+    client: AsyncClient, make_worker: Callable[..., Worker]
+) -> None:
+    failed = await _run_to_the_end(client, make_worker, failure_simulation="test_failure")
+    assert failed["state"] == "FAILED"
+    assert failed["final_result"] == "2/3 tests passed"
+    assert "1 of 3 tests did not pass (connectivity_check: FAILED)" in failed["error_message"]
+    assert [t["status"] for t in failed["tests"]] == ["FAILED", "PASSED", "PASSED"]
+    assert "Simulated test failure" in failed["tests"][0]["error_message"]
+    assert failed["test_counts"]["failed"] == 1 and failed["test_counts"]["passed"] == 2
+
+    timed_out = await _run_to_the_end(
+        client, make_worker, failure_simulation="test_timeout", timeout_seconds=1
+    )
+    assert timed_out["state"] == "FAILED"
+    assert timed_out["final_result"] == "2/3 tests passed"
+    assert [t["status"] for t in timed_out["tests"]] == ["TIMED_OUT", "PASSED", "PASSED"]
+    assert timed_out["tests"][0]["duration_ms"] == 1000
+    assert "exceeded the run timeout of 1 s" in timed_out["tests"][0]["error_message"]
+    assert timed_out["test_counts"]["timed_out"] == 1

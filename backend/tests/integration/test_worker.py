@@ -15,7 +15,7 @@ from app.persistence.db import Database
 from app.persistence.models import Run, RunTest
 from app.persistence.repository import RunRepository, WorkerRepository
 from app.services import RunService
-from app.worker_service import serve
+from app.worker_service import check, serve
 from tests.conftest import (
     DeployGateInfrastructure,
     GateInfrastructure,
@@ -522,3 +522,76 @@ async def test_worker_service_runs_until_stopped(db: Database, test_settings: Se
 
 async def _is(db: Database, run_id: int, state: str) -> bool:
     return await state_of(db, run_id) == state
+
+
+async def test_two_workers_polling_at_once_never_claim_the_same_run(
+    db: Database, make_worker: Callable[..., Worker]
+) -> None:
+    """FOR UPDATE SKIP LOCKED under real contention: both workers tick in the
+    same instant, several rounds; every run is claimed exactly once."""
+    a = make_worker(worker_id="w-a")
+    b = make_worker(worker_id="w-b")
+    claimed_by: dict[int, list[str]] = {}
+    created: list[int] = []
+    for _ in range(5):
+        batch = [await create(db, environment="test"), await create(db, environment="stage")]
+        created.extend(batch)
+        launched_a, launched_b = await asyncio.gather(a.tick(), b.tick())
+        for run_id in launched_a:
+            claimed_by.setdefault(run_id, []).append("w-a")
+        for run_id in launched_b:
+            claimed_by.setdefault(run_id, []).append("w-b")
+        await a.wait_idle()
+        await b.wait_idle()
+
+    assert sorted(claimed_by) == sorted(created)
+    assert all(len(owners) == 1 for owners in claimed_by.values()), claimed_by
+    for run_id in created:
+        assert await state_of(db, run_id) == RunState.COMPLETED
+    await a.stop()
+    await b.stop()
+
+
+async def test_heartbeat_keeps_extending_the_lease_while_a_run_executes(
+    db: Database, make_worker: Callable[..., Worker]
+) -> None:
+    gate = GateInfrastructure()
+    worker = make_worker(infrastructure=gate, worker_id="w-beat")
+    run_id = await create(db)
+    await worker.start()
+    await gate.entered.wait()
+
+    first = await _load(db, run_id)
+    assert first.worker_id == "w-beat" and first.lease_token == worker.lease_token
+    assert first.lease_expires_at is not None
+
+    async def lease_moved_forward() -> bool:
+        current = (await _load(db, run_id)).lease_expires_at
+        return current is not None and current > first.lease_expires_at  # type: ignore[operator]
+
+    # Heartbeat interval is 1 s in tests.
+    await eventually(lease_moved_forward, timeout=5)
+    renewed = await _load(db, run_id)
+    assert renewed.lease_token == worker.lease_token  # same holder, just a longer lease
+    assert renewed.state == RunState.PREPARING
+
+    gate.gate.set()
+    await eventually(lambda: _status_is(db, run_id, RunState.COMPLETED))
+    await worker.stop()
+
+
+async def test_container_health_check_follows_this_workers_heartbeat(
+    db: Database, test_settings: Settings, make_worker: Callable[..., Worker]
+) -> None:
+    """`python -m app.worker_service --check` is the container health check:
+    it passes only while *this* worker's heartbeat row is fresh."""
+    settings = test_settings.model_copy(update={"worker_id": "w-probe"})
+    assert await check(settings) is False  # never heartbeat
+
+    worker = make_worker(worker_id="w-probe")
+    await worker.tick()
+    assert await check(settings) is True
+    assert await check(settings.model_copy(update={"worker_id": "someone-else"})) is False
+
+    await worker.stop()
+    assert await check(settings) is False

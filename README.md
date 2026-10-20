@@ -410,7 +410,7 @@ the backend is authoritative.
 
 ```bash
 cd backend
-uv run pytest            # 92 tests, ~17 s, needs the docker-compose database
+uv run pytest            # 99 tests, ~25 s, needs the docker-compose database
 uv run ruff check . && uv run mypy app
 ```
 
@@ -429,11 +429,17 @@ uv run ruff check . && uv run mypy app
   queueing on a busy environment, cancellation (queued, mid-step and
   mid-test), lost leases, restart/resume scenarios including take-over in
   `DEPLOYING` with and without a requested deployment, two workers sharing a
-  `WORKER_ID`, heartbeats and the standalone worker process
-  (`app.worker_service`).
+  `WORKER_ID`, two workers polling at the same instant (`SKIP LOCKED` under
+  contention), the heartbeat extending a live lease, the container health
+  check, and the standalone worker process (`app.worker_service`).
 - `tests/integration/test_api.py` — the HTTP contract, validation errors,
-  snapshot immutability, filters, pagination, and `/health` turning `ok`
-  only while a worker heartbeats.
+  snapshot immutability, filters, pagination, `/health` turning `ok` only
+  while a worker heartbeats, and how finished runs are presented (final
+  result, per-test statuses, counts, duration) for every outcome.
+- `tests/integration/test_migrations.py` — `alembic upgrade head` on an
+  empty database produces exactly the schema the models describe
+  (`compare_metadata` diff is empty), `downgrade base` is clean, and the
+  chain replays. Catches a model change that forgot its migration.
 
 Tests run against a real PostgreSQL (`orchestrator_test`, created
 automatically) because the guarantees under test are PostgreSQL features. CI
