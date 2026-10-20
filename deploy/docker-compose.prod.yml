@@ -50,7 +50,9 @@ services:
         condition: service_healthy   # migrations are applied by the API on start
     environment:
       DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-orchestrator}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-orchestrator}
-      WORKER_ID: ${WORKER_ID:-}
+      # No WORKER_ID here on purpose: each replica identifies itself by its
+      # container hostname, which Docker makes unique. A shared id is the one
+      # misconfiguration the worker cannot fully undo, so it is not configurable.
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
       WORKER_LEASE_SECONDS: ${WORKER_LEASE_SECONDS:-15}
       MOCK_PREPARE_DELAY_MS: ${MOCK_PREPARE_DELAY_MS:-2000}

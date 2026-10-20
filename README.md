@@ -265,8 +265,8 @@ safe:
    (the id is the container hostname, which survives a restart, so a
    restarted container takes its own runs back immediately rather than
    after 15 s). The "its own" part is skipped, with a warning, if a process
-   with the same id is still heartbeating: that means `WORKER_ID` is shared
-   by several replicas, and the newcomer must not rob a live worker. Each
+   with the same id is still heartbeating: that means two processes share
+   an id, and the newcomer must not rob a live worker. Each
    tick also reclaims expired leases, which covers a second worker taking
    over from a dead one, or a new worker taking over from an old one after a
    redeploy.
@@ -338,13 +338,14 @@ report success until a heartbeat is fresh.
   session, so no transaction stays open while waiting on an adapter.
 - Claiming uses `SELECT ... FOR UPDATE SKIP LOCKED`, so several worker
   processes poll the same table without double-claiming:
-  `docker compose up -d --scale worker=3` works as is. Leave `WORKER_ID`
-  empty when scaling; each container then identifies itself by hostname.
-  Correctness does not depend on it: writes are fenced on the per-process
-  `lease_token`, not on `worker_id`. A shared id only costs the fast
+  `docker compose up -d --scale worker=3` works as is; each container
+  identifies itself by hostname. `WORKER_ID` is a local-development setting
+  and is deliberately not wired into the production compose file, so two
+  replicas cannot be given the same id by a `.env` typo. Correctness would
+  not depend on it anyway: writes are fenced on the per-process
+  `lease_token`, not on `worker_id`. A shared id would only cost the fast
   take-back of own runs after a restart (the newcomer waits for the lease
-  like any other worker) and makes the replicas indistinguishable in
-  `/api/health`.
+  like any other worker) and merge the replicas in `/api/health`.
 - A partial unique index `uq_runs_one_active_per_environment ON runs
   (environment_id) WHERE state IN (PREPARING, …, COLLECTING_RESULTS)` makes
   "one active deployment per environment" a database guarantee. The claim
@@ -447,9 +448,9 @@ build and a Docker build on every push.
 - `deploy/docker-compose.prod.yml` runs PostgreSQL (named volume), `app`
   (API), two `worker` replicas and Caddy, which terminates TLS with an
   automatic Let's Encrypt certificate for `DOMAIN`. Only ports 80/443 are
-  published; the database is internal. `WORKER_ID` is left empty, so each
-  replica identifies itself by its container hostname (visible in
-  `/api/health` and in the "Run started on worker …" event). `worker` waits
+  published; the database is internal. Worker ids are not configurable
+  there: each replica identifies itself by its container hostname (visible
+  in `/api/health` and in the "Run started on worker …" event). `worker` waits
   for `app` to be healthy so migrations are applied before it starts; its
   own health check is `python -m app.worker_service --check`, which passes
   while the worker's heartbeat row is fresh.
