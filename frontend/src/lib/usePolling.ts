@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 interface PollingState<T> {
   data: T | null;
@@ -9,7 +9,8 @@ interface PollingState<T> {
 
 /**
  * Fetch `load()` immediately and then every `intervalMs` while `active` is
- * true. The backend owns the run lifecycle; the UI only re-reads it.
+ * true. A new `load` (for example after a filter change) refetches at once.
+ * The backend owns the run lifecycle; the UI only re-reads it.
  */
 export function usePolling<T>(
   load: () => Promise<T>,
@@ -19,12 +20,10 @@ export function usePolling<T>(
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const loadRef = useRef(load);
-  loadRef.current = load;
 
   const refresh = useCallback(async () => {
     try {
-      const next = await loadRef.current();
+      const next = await load();
       setData(next);
       setError(null);
     } catch (err) {
@@ -32,7 +31,7 @@ export function usePolling<T>(
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [load]);
 
   useEffect(() => {
     let cancelled = false;

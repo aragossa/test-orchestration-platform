@@ -442,9 +442,23 @@ uv run ruff check . && uv run mypy app
   chain replays. Catches a model change that forgot its migration.
 
 Tests run against a real PostgreSQL (`orchestrator_test`, created
-automatically) because the guarantees under test are PostgreSQL features. CI
-(`.github/workflows/ci.yml`) runs lint, mypy, migrations, tests, the frontend
-build and a Docker build on every push.
+automatically) because the guarantees under test are PostgreSQL features.
+
+```bash
+cd frontend
+npm test                 # 32 component tests with vitest + Testing Library, ~3 s
+```
+
+The frontend tests feed each page the API payloads it would receive (a stubbed
+`fetch`, fixtures in `src/test/mockApi.ts`) and check what is rendered: the
+runs table and its filters, a finished / failed / active run's details with
+timeline, test rows and cancel button, the new-run form (defaults loaded from
+the backend, validation, the exact payload it posts), the health indicator in
+the header, and the formatting helpers. No backend is involved: the UI's only
+job is to render what the API returns, and that is what these tests pin down.
+
+CI (`.github/workflows/ci.yml`) runs lint, mypy, migrations, backend tests, the
+frontend tests and build, and a Docker build on every push.
 
 ## Deployment
 

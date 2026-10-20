@@ -12,7 +12,7 @@ cd backend && uv run pytest                 # all tests (unit + integration)
 cd backend && uv run pytest tests/unit      # fast, no database
 cd backend && uv run ruff check . && uv run ruff format --check .
 cd backend && uv run mypy app
-cd frontend && npm run lint && npm run build
+cd frontend && npm run lint && npm test && npm run build
 ```
 
 ## Invariants — do not break

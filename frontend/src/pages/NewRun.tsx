@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { cloneElement, useEffect, useId, useMemo, useState, type ReactElement } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   api,
@@ -319,15 +319,18 @@ function Field({
   error?: string;
   hint?: string;
   overridden?: boolean;
-  children: React.ReactNode;
+  children: ReactElement<{ id?: string }>;
 }) {
+  // Associate the label with its input so it is reachable by assistive tech
+  // (and by tests) via the label text.
+  const id = useId();
   return (
     <div className="field">
-      <label>
+      <label htmlFor={id}>
         {label}
         {overridden ? <span className="badge warn" style={{ marginLeft: 6 }}>overridden</span> : null}
       </label>
-      {children}
+      {cloneElement(children, { id })}
       {error ? <span className="field-error">{error}</span> : hint ? <span className="field-hint">{hint}</span> : null}
     </div>
   );
