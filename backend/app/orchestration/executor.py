@@ -28,7 +28,7 @@ from app.domain.states import (
     is_terminal,
 )
 from app.persistence.db import Database
-from app.persistence.models import Run, RunTest
+from app.persistence.models import RunTest
 from app.persistence.repository import (
     EnvironmentBusyError,
     LostOwnershipError,
@@ -88,6 +88,9 @@ class RunExecutor:
                 return
 
             if state is RunState.PENDING:
+                # Read before the attempt: a failed transition rolls the session
+                # back, which expires `run` and makes its attributes unloadable.
+                previous_step = run.current_step
                 try:
                     await repo.transition(
                         run_id,
@@ -97,7 +100,9 @@ class RunExecutor:
                         current_step="Preparing environment",
                     )
                 except EnvironmentBusyError:
-                    await self._park_for_busy_environment(repo, run)
+                    await self._park_for_busy_environment(
+                        repo, run_id, config.environment, previous_step
+                    )
                     return
                 except LostOwnershipError as exc:
                     log.warning("run %s: %s", run_id, exc)
@@ -410,17 +415,19 @@ class RunExecutor:
             except StaleRunError as exc:
                 log.info("run %s: could not cancel: %s", run_id, exc)
 
-    async def _park_for_busy_environment(self, repo: RunRepository, run: Run) -> None:
+    async def _park_for_busy_environment(
+        self, repo: RunRepository, run_id: int, environment: str, previous_step: str | None
+    ) -> None:
         """Leave a queued run in PENDING until its environment frees up."""
-        waiting_step = f"Waiting for environment '{run.environment_id}' to become free"
-        if run.current_step != waiting_step:
+        waiting_step = f"Waiting for environment '{environment}' to become free"
+        if previous_step != waiting_step:
             await repo.add_event(
-                run.id,
-                f"Environment '{run.environment_id}' is busy with another run; waiting",
+                run_id,
+                f"Environment '{environment}' is busy with another run; waiting",
                 level="warning",
             )
-        await repo.update_run(run.id, owner=self.lease_token, current_step=waiting_step)
-        await repo.release_claim(run.id, self.lease_token)
+        await repo.update_run(run_id, owner=self.lease_token, current_step=waiting_step)
+        await repo.release_claim(run_id, self.lease_token)
 
     # --------------------------------------------------------------- helpers
 

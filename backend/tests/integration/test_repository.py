@@ -340,3 +340,23 @@ async def test_terminal_transition_clears_the_lease_token(db: Database) -> None:
         await repo.transition(run_id, RunState.PREPARING, RunState.FAILED, owner="tok", reason="x")
         run = await repo.get_run_or_raise(run_id)
         assert run.worker_id is None and run.lease_token is None
+
+
+async def test_release_claim_only_honours_the_holding_token(db: Database) -> None:
+    async with db.session() as session:
+        repo = RunRepository(session)
+        run_id = (await repo.create_run(make_config())).id
+        assert await repo.claim_pending_runs("w-a", "tok-a", lease_seconds=60, limit=1) == [run_id]
+
+        await repo.release_claim(run_id, "tok-b")  # not the holder: no-op
+        run = await repo.get_run_or_raise(run_id)
+        assert run.worker_id == "w-a" and run.lease_token == "tok-a"
+        assert await repo.claim_pending_runs("w-b", "tok-b", lease_seconds=60, limit=1) == []
+
+        await repo.release_claim(run_id, "tok-a")
+        session.expire_all()
+        run = await repo.get_run_or_raise(run_id)
+        assert run.worker_id is None and run.lease_token is None
+        assert run.lease_expires_at is None
+        # Released, the run is up for grabs again.
+        assert await repo.claim_pending_runs("w-b", "tok-b", lease_seconds=60, limit=1) == [run_id]

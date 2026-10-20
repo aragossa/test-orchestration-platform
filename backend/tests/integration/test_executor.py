@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import update
 
 from app.adapters import MockInfrastructureAdapter
+from app.adapters.base import DeploymentFailedError
 from app.domain.states import FailureSimulation, RunState, TestStatus
 from app.orchestration.executor import RunExecutor
 from app.persistence.db import Database
@@ -208,3 +209,79 @@ async def test_every_simulation_reaches_a_terminal_state(
     assert run.state == expected
     # A finished run never has tests still waiting to be executed.
     assert all(t.status not in (TestStatus.PENDING, TestStatus.RUNNING) for t in run.tests)
+
+
+async def _steal(db: Database, run_id: int, new_token: str) -> None:
+    """Another worker takes the run over: it writes its own lease token."""
+    async with db.session() as session:
+        await session.execute(
+            update(Run)
+            .where(Run.id == run_id)
+            .values(worker_id="other-worker", lease_token=new_token, lease_expires_at=utcnow())
+        )
+        await session.commit()
+
+
+async def test_stale_worker_cannot_fail_a_run_it_lost(db: Database, runner: SpyTestRunner) -> None:
+    """The deployment errors out on worker A *after* worker B took the run
+    over. A's attempt to mark the run FAILED is fenced out: the run stays as B
+    left it, with no FAILED transition, no event and no skipped tests."""
+
+    class StolenThenFailing(MockInfrastructureAdapter):
+        async def deploy(  # type: ignore[override]
+            self, environment: str, config: object, *, idempotency_key: str
+        ) -> None:
+            await _steal(db, run_id, "token-of-b")
+            raise DeploymentFailedError("rollout failed")
+
+    run_id = await create(db)
+    run = await execute(db, run_id, StolenThenFailing(prepare_delay_ms=0), runner)
+
+    assert run.state == RunState.DEPLOYING
+    assert run.worker_id == "other-worker" and run.lease_token == "token-of-b"
+    assert run.error_message is None
+    assert [t.to_state for t in run.transitions] == ["PENDING", "PREPARING", "DEPLOYING"]
+    assert [t.status for t in run.tests] == [TestStatus.PENDING] * 3
+    assert not any("Run failed" in e.message for e in run.events)
+
+
+async def test_run_stolen_right_after_claim_is_not_started(
+    db: Database, infrastructure: MockInfrastructureAdapter, runner: SpyTestRunner
+) -> None:
+    """The lease changed hands between the claim and the very first write."""
+    run_id = await create(db)
+    await _steal(db, run_id, "token-of-b")
+    await RunExecutor(db, infrastructure, runner, "test-worker", TOKEN).execute(run_id)
+
+    run = await load(db, run_id)
+    assert run.state == RunState.PENDING
+    assert run.lease_token == "token-of-b"
+    assert [t.to_state for t in run.transitions] == ["PENDING"]
+    assert not any("Run started" in e.message for e in run.events)
+    assert runner.calls == []
+
+
+async def test_run_claimed_for_a_busy_environment_is_parked_and_released(
+    db: Database, infrastructure: MockInfrastructureAdapter, runner: SpyTestRunner
+) -> None:
+    """The claim query normally keeps a run off a busy environment; if one
+    slips through, PENDING -> PREPARING hits the partial unique index and the
+    run is parked: its claim is released (by token) so any worker can retry."""
+    async with db.session() as session:
+        repo = RunRepository(session)
+        occupant = (await repo.create_run(make_config(environment="test"))).id
+        await repo.transition(occupant, RunState.PENDING, RunState.PREPARING)
+    run_id = await create(db, environment="test")
+
+    run = await execute(db, run_id, infrastructure, runner)
+
+    assert run.state == RunState.PENDING
+    assert run.worker_id is None and run.lease_token is None and run.lease_expires_at is None
+    assert run.current_step == "Waiting for environment 'test' to become free"
+    assert [t.to_state for t in run.transitions] == ["PENDING"]
+    assert any("is busy with another run; waiting" in e.message for e in run.events)
+    assert runner.calls == []
+
+    # Being parked twice does not repeat the event.
+    again = await execute(db, run_id, infrastructure, runner)
+    assert sum("is busy with another run" in e.message for e in again.events) == 1

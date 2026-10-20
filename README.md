@@ -410,7 +410,7 @@ the backend is authoritative.
 
 ```bash
 cd backend
-uv run pytest            # 88 tests, ~16 s, needs the docker-compose database
+uv run pytest            # 92 tests, ~17 s, needs the docker-compose database
 uv run ruff check . && uv run mypy app
 ```
 
@@ -423,7 +423,8 @@ uv run ruff check . && uv run mypy app
 - `tests/integration/test_executor.py` — every scenario end to end against
   PostgreSQL with zero-delay mocks: happy path, deployment failure (tests
   skipped, runner never called), test failure, test timeout, readiness
-  timeout, unexpected exceptions.
+  timeout, unexpected exceptions, a stale worker whose late failure or first
+  write is fenced out, a run parked on a busy environment.
 - `tests/integration/test_worker.py` — concurrency across environments,
   queueing on a busy environment, cancellation (queued, mid-step and
   mid-test), lost leases, restart/resume scenarios including take-over in
