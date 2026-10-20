@@ -47,7 +47,11 @@ class MockInfrastructureAdapter:
                 f"Environment '{environment}' preparation failed: namespace quota exceeded"
             )
 
-    async def deploy(self, environment: str, config: RunConfig) -> DeploymentResult:
+    async def deploy(
+        self, environment: str, config: RunConfig, *, idempotency_key: str
+    ) -> DeploymentResult:
+        # The mock does not deduplicate by key: its memory is per process, so
+        # pretending to would give a guarantee two worker replicas do not have.
         await asyncio.sleep(self.deploy_delay_ms / 1000)
         if config.failure_simulation is FailureSimulation.DEPLOYMENT_FAILURE:
             raise DeploymentFailedError(

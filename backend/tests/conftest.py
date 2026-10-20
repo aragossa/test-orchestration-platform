@@ -18,7 +18,7 @@ import pytest
 from sqlalchemy import text
 
 from app.adapters import MockInfrastructureAdapter, MockTestExecutionAdapter
-from app.adapters.base import ExecutionContext, TestResult
+from app.adapters.base import DeploymentResult, ExecutionContext, TestResult
 from app.config import Settings
 from app.domain.config import RunConfig
 from app.domain.states import FailureSimulation
@@ -129,6 +129,25 @@ class GateInfrastructure(MockInfrastructureAdapter):
         self.prepare_calls += 1
         self.entered.set()
         await self.gate.wait()
+
+
+class DeployGateInfrastructure(MockInfrastructureAdapter):
+    """Mock infrastructure whose deploy step blocks until released and counts
+    how many deployments were actually requested."""
+
+    def __init__(self) -> None:
+        super().__init__(prepare_delay_ms=0, deploy_delay_ms=0, ready_delay_ms=0)
+        self.gate = asyncio.Event()
+        self.entered = asyncio.Event()
+        self.deploy_calls: list[str] = []
+
+    async def deploy(
+        self, environment: str, config: RunConfig, *, idempotency_key: str
+    ) -> DeploymentResult:
+        self.deploy_calls.append(idempotency_key)
+        self.entered.set()
+        await self.gate.wait()
+        return await super().deploy(environment, config, idempotency_key=idempotency_key)
 
 
 @pytest.fixture

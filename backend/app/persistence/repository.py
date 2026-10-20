@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import exists, func, or_, select, update
+from sqlalchemy import Interval, exists, func, literal, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -50,6 +50,18 @@ class StaleRunError(Exception):
         super().__init__(f"Run {run_id} is no longer in {expected}; refused transition to {target}")
 
 
+class LostOwnershipError(StaleRunError):
+    """The run is no longer leased to this worker process: another worker took
+    it over (or it finished). Nothing was written."""
+
+    def __init__(self, run_id: int, operation: str) -> None:
+        self.run_id = run_id
+        self.operation = operation
+        Exception.__init__(
+            self, f"Run {run_id} is no longer owned by this worker; refused {operation}"
+        )
+
+
 class EnvironmentBusyError(Exception):
     """Another run is already active in the target environment."""
 
@@ -74,6 +86,12 @@ def utcnow() -> datetime:
 
 def default_worker_id() -> str:
     return socket.gethostname()
+
+
+def _lease_until(lease_seconds: int) -> Any:
+    """`now() + lease` evaluated by the database, so leases written by
+    different hosts are compared against one clock."""
+    return func.now() + literal(timedelta(seconds=lease_seconds), Interval)
 
 
 class RunRepository:
@@ -172,6 +190,7 @@ class RunRepository:
         target: RunState,
         *,
         reason: str | None = None,
+        owner: str | None = None,
         **fields: Any,
     ) -> None:
         """Move a run from `expected` to `target`, atomically.
@@ -179,8 +198,13 @@ class RunRepository:
         Raises InvalidTransitionError if the domain forbids it, StaleRunError if
         the row is not in `expected` any more, and EnvironmentBusyError if the
         move would make a second run active in the same environment.
+
+        `owner` is the caller's lease token. When given, the write is fenced:
+        it only happens if the run is still leased to that token, otherwise
+        LostOwnershipError (a StaleRunError) is raised and nothing is written.
+        Workers always pass it; the API, which never executes runs, does not.
         """
-        await self._apply_transition(run_id, expected, target, reason, fields)
+        await self._apply_transition(run_id, expected, target, reason, fields, owner)
         await self.session.commit()
         log.info("run %s: %s -> %s%s", run_id, expected, target, f" ({reason})" if reason else "")
 
@@ -195,6 +219,7 @@ class RunRepository:
         event_message: str,
         event_level: str = "error",
         event_payload: dict[str, Any] | None = None,
+        owner: str | None = None,
         **fields: Any,
     ) -> int:
         """Move a run to a terminal state, skip its unfinished tests and record
@@ -203,12 +228,13 @@ class RunRepository:
         A run must never be observed as finished while some of its tests are
         still PENDING or RUNNING, so the three writes are committed together:
         either all of them land or none does. Returns the number of tests that
-        were marked SKIPPED. Raises the same errors as `transition()`.
+        were marked SKIPPED. Raises the same errors as `transition()`, and is
+        fenced by `owner` the same way.
         """
         if target not in TERMINAL_STATES:
             raise ValueError(f"finish_run() needs a terminal target, got {target}")
         fields.setdefault("error_message", reason)
-        await self._apply_transition(run_id, expected, target, reason, fields)
+        await self._apply_transition(run_id, expected, target, reason, fields, owner)
         skipped = await self._skip_unfinished_tests(run_id, skip_message)
         self.session.add(
             RunEvent(
@@ -237,6 +263,7 @@ class RunRepository:
         target: RunState,
         reason: str | None,
         fields: dict[str, Any],
+        owner: str | None,
     ) -> None:
         """Stage the state change and its history row without committing."""
         assert_transition(expected, target)
@@ -248,11 +275,12 @@ class RunRepository:
             values.setdefault("finished_at", now)
             values.setdefault("current_step", None)
             values.setdefault("worker_id", None)
+            values.setdefault("lease_token", None)
             values.setdefault("lease_expires_at", None)
 
         stmt = (
             update(Run)
-            .where(Run.id == run_id, Run.state == expected)
+            .where(Run.id == run_id, Run.state == expected, *self._owned_by(owner))
             .values(**values)
             .returning(Run.environment_id)
         )
@@ -266,15 +294,33 @@ class RunRepository:
             raise
         if environment_id is None:
             await self.session.rollback()
+            if owner is not None and not await self._is_owned_by(run_id, owner):
+                raise LostOwnershipError(run_id, f"transition to {target}")
             raise StaleRunError(run_id, expected, target)
 
         self.session.add(
             RunTransition(run_id=run_id, from_state=expected, to_state=target, reason=reason)
         )
 
-    async def update_run(self, run_id: int, **fields: Any) -> None:
-        stmt = update(Run).where(Run.id == run_id).values(updated_at=utcnow(), **fields)
-        await self.session.execute(stmt)
+    @staticmethod
+    def _owned_by(owner: str | None) -> list[Any]:
+        """Extra WHERE clause fencing a write on the caller's lease token."""
+        return [] if owner is None else [Run.lease_token == owner]
+
+    async def _is_owned_by(self, run_id: int, owner: str) -> bool:
+        stmt = select(Run.lease_token).where(Run.id == run_id)
+        return (await self.session.scalar(stmt)) == owner
+
+    async def update_run(self, run_id: int, *, owner: str | None = None, **fields: Any) -> None:
+        stmt = (
+            update(Run)
+            .where(Run.id == run_id, *self._owned_by(owner))
+            .values(updated_at=utcnow(), **fields)
+        )
+        result = await self.session.execute(stmt)
+        if owner is not None and not getattr(result, "rowcount", 0):
+            await self.session.rollback()
+            raise LostOwnershipError(run_id, "update_run")
         await self.session.commit()
 
     async def add_event(
@@ -294,9 +340,47 @@ class RunRepository:
             message,
         )
 
-    async def update_test(self, run_test_id: int, **fields: Any) -> None:
-        stmt = update(RunTest).where(RunTest.id == run_test_id).values(**fields)
-        await self.session.execute(stmt)
+    async def update_test(
+        self, run_test_id: int, *, owner: str | None = None, **fields: Any
+    ) -> None:
+        """Update one test row; with `owner`, only if its run is still leased
+        to that token (LostOwnershipError otherwise)."""
+        conditions = [RunTest.id == run_test_id]
+        if owner is not None:
+            conditions.append(RunTest.run_id.in_(select(Run.id).where(Run.lease_token == owner)))
+        result = await self.session.execute(update(RunTest).where(*conditions).values(**fields))
+        if owner is not None and not getattr(result, "rowcount", 0):
+            await self.session.rollback()
+            run_id = await self.session.scalar(
+                select(RunTest.run_id).where(RunTest.id == run_test_id)
+            )
+            raise LostOwnershipError(run_id or -1, "update_test")
+        await self.session.commit()
+
+    async def mark_deploy_requested(self, run_id: int, owner: str, worker_id: str) -> None:
+        """Record, before the infrastructure is called, that this worker is
+        about to request the run's deployment.
+
+        Fenced on the lease token and on `deploy_requested_at IS NULL`: it
+        succeeds at most once per run, so two workers can never both pass it.
+        """
+        stmt = (
+            update(Run)
+            .where(
+                Run.id == run_id,
+                Run.state == RunState.DEPLOYING,
+                Run.lease_token == owner,
+                Run.deploy_requested_at.is_(None),
+            )
+            .values(
+                deploy_requested_at=utcnow(), deploy_requested_by=worker_id, updated_at=utcnow()
+            )
+            .returning(Run.id)
+        )
+        marked = (await self.session.execute(stmt)).scalar_one_or_none() is not None
+        if not marked:
+            await self.session.rollback()
+            raise LostOwnershipError(run_id, "deployment request")
         await self.session.commit()
 
     async def _skip_unfinished_tests(self, run_id: int, message: str) -> int:
@@ -354,7 +438,9 @@ class RunRepository:
 
     # ------------------------------------------------------- worker leasing
 
-    async def claim_pending_runs(self, worker_id: str, lease_seconds: int, limit: int) -> list[int]:
+    async def claim_pending_runs(
+        self, worker_id: str, lease_token: str, lease_seconds: int, limit: int
+    ) -> list[int]:
         """Take ownership of queued runs whose environment is free.
 
         FOR UPDATE SKIP LOCKED lets several workers poll concurrently without
@@ -364,7 +450,6 @@ class RunRepository:
         """
         if limit <= 0:
             return []
-        now = utcnow()
         other = Run.__table__.alias("other")
         env_busy = exists(
             select(1).where(
@@ -376,7 +461,7 @@ class RunRepository:
             select(Run.id, Run.environment_id)
             .where(
                 Run.state == RunState.PENDING,
-                or_(Run.worker_id.is_(None), Run.lease_expires_at < now),
+                or_(Run.worker_id.is_(None), Run.lease_expires_at < func.now()),
                 ~env_busy,
             )
             .order_by(Run.id)
@@ -397,26 +482,33 @@ class RunRepository:
                 .where(Run.id.in_(chosen))
                 .values(
                     worker_id=worker_id,
-                    lease_expires_at=now + timedelta(seconds=lease_seconds),
-                    updated_at=now,
+                    lease_token=lease_token,
+                    lease_expires_at=_lease_until(lease_seconds),
+                    updated_at=func.now(),
                 )
             )
         await self.session.commit()
         return chosen
 
     async def reclaim_abandoned_runs(
-        self, worker_id: str, lease_seconds: int, limit: int, *, include_own: bool = False
+        self,
+        worker_id: str,
+        lease_token: str,
+        lease_seconds: int,
+        limit: int,
+        *,
+        include_own: bool = False,
     ) -> list[int]:
         """Take over active runs whose owner stopped renewing its lease.
 
         With include_own=True (used at startup) runs that this very worker owned
         before a restart are taken back immediately, without waiting for the
-        lease to expire.
+        lease to expire. Taking over writes a new lease token, which fences
+        out whatever process held the run before.
         """
         if limit <= 0:
             return []
-        now = utcnow()
-        ownership = Run.lease_expires_at < now
+        ownership = Run.lease_expires_at < func.now()
         if include_own:
             ownership = or_(ownership, Run.worker_id == worker_id)
         candidates = (
@@ -431,8 +523,9 @@ class RunRepository:
             .where(Run.id.in_(candidates))
             .values(
                 worker_id=worker_id,
-                lease_expires_at=now + timedelta(seconds=lease_seconds),
-                updated_at=now,
+                lease_token=lease_token,
+                lease_expires_at=_lease_until(lease_seconds),
+                updated_at=func.now(),
             )
             .returning(Run.id)
         )
@@ -440,23 +533,23 @@ class RunRepository:
         await self.session.commit()
         return ids
 
-    async def extend_lease(self, run_id: int, worker_id: str, lease_seconds: int) -> bool:
-        now = utcnow()
+    async def extend_lease(self, run_id: int, lease_token: str, lease_seconds: int) -> bool:
+        """Renew the lease; False if this token no longer holds the run."""
         stmt = (
             update(Run)
-            .where(Run.id == run_id, Run.worker_id == worker_id)
-            .values(lease_expires_at=now + timedelta(seconds=lease_seconds))
+            .where(Run.id == run_id, Run.lease_token == lease_token)
+            .values(lease_expires_at=_lease_until(lease_seconds))
             .returning(Run.id)
         )
         renewed = (await self.session.execute(stmt)).scalar_one_or_none() is not None
         await self.session.commit()
         return renewed
 
-    async def release_claim(self, run_id: int, worker_id: str) -> None:
+    async def release_claim(self, run_id: int, lease_token: str) -> None:
         stmt = (
             update(Run)
-            .where(Run.id == run_id, Run.worker_id == worker_id)
-            .values(worker_id=None, lease_expires_at=None, updated_at=utcnow())
+            .where(Run.id == run_id, Run.lease_token == lease_token)
+            .values(worker_id=None, lease_token=None, lease_expires_at=None, updated_at=utcnow())
         )
         await self.session.execute(stmt)
         await self.session.commit()
@@ -489,6 +582,16 @@ class WorkerRepository:
         )
         await self.session.execute(stmt)
         await self.session.commit()
+
+    async def is_alive(self, worker_id: str, stale_after_seconds: int) -> bool:
+        """True if a process with this id heartbeat recently and did not stop."""
+        cutoff = utcnow() - timedelta(seconds=stale_after_seconds)
+        stmt = select(WorkerRecord.id).where(
+            WorkerRecord.id == worker_id,
+            WorkerRecord.stopped_at.is_(None),
+            WorkerRecord.last_heartbeat_at >= cutoff,
+        )
+        return (await self.session.scalar(stmt)) is not None
 
     async def mark_stopped(self, worker_id: str) -> None:
         stmt = update(WorkerRecord).where(WorkerRecord.id == worker_id).values(stopped_at=utcnow())

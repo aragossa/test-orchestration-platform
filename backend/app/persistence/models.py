@@ -100,7 +100,14 @@ class Run(Base):
     error_message: Mapped[str | None] = mapped_column(Text)
     deployment_id: Mapped[str | None] = mapped_column(String(64))
     worker_id: Mapped[str | None] = mapped_column(String(128))
+    # Fencing token of the process that holds the lease. `worker_id` is a
+    # stable identity (hostname); the token is unique per process start, so
+    # even two processes sharing a worker_id cannot write over each other.
+    lease_token: Mapped[str | None] = mapped_column(String(64))
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set before the infrastructure is asked to deploy; see RunExecutor._deploy.
+    deploy_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    deploy_requested_by: Mapped[str | None] = mapped_column(String(128))
     cancel_requested_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

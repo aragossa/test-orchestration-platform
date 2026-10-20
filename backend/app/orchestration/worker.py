@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 from datetime import datetime
 from typing import Any
 
@@ -40,7 +41,13 @@ class Worker:
         self.db = db
         self.settings = settings
         self.worker_id = settings.worker_id or default_worker_id()
-        self.executor = RunExecutor(db, infrastructure, test_runner, self.worker_id)
+        # Identity vs fencing: worker_id is stable across restarts (hostname) and
+        # is what heartbeats and startup recovery key on; lease_token is unique
+        # to this process start and is what every write to a run is fenced on.
+        self.lease_token = uuid.uuid4().hex
+        self.executor = RunExecutor(
+            db, infrastructure, test_runner, self.worker_id, self.lease_token
+        )
         self._tasks: dict[int, asyncio.Task[None]] = {}
         self._stop = asyncio.Event()
         self._main: asyncio.Task[None] | None = None
@@ -74,6 +81,7 @@ class Worker:
     def status(self) -> dict[str, Any]:
         return {
             "worker_id": self.worker_id,
+            "lease_token": self.lease_token,
             "running": self._main is not None and not self._main.done(),
             "active_runs": sorted(self._tasks),
             "concurrency": self.settings.worker_concurrency,
@@ -114,11 +122,25 @@ class Worker:
                     self.worker_id,
                     self.reconciled_run_ids,
                 )
+            # Taking back "my own" runs assumes the previous holder of this id is
+            # gone. If a process with the same id is still heartbeating, the id is
+            # shared by mistake (WORKER_ID set with several replicas): do not rob
+            # it; fall back to ordinary lease expiry.
+            include_own = not await WorkerRepository(session).is_alive(
+                self.worker_id, self.settings.worker_lease_seconds
+            )
+            if not include_own:
+                log.warning(
+                    "worker %s: another live worker uses the same id; not reclaiming its runs "
+                    "(set a unique WORKER_ID per process or leave it empty)",
+                    self.worker_id,
+                )
             ids = await repo.reclaim_abandoned_runs(
                 self.worker_id,
+                self.lease_token,
                 self.settings.worker_lease_seconds,
                 self.settings.worker_concurrency,
-                include_own=True,
+                include_own=include_own,
             )
         self.recovered_run_ids = ids
         if ids:
@@ -144,11 +166,14 @@ class Worker:
         async with self.db.session() as session:
             repo = RunRepository(session)
             abandoned = await repo.reclaim_abandoned_runs(
-                self.worker_id, self.settings.worker_lease_seconds, free
+                self.worker_id, self.lease_token, self.settings.worker_lease_seconds, free
             )
             launched.extend(abandoned)
             pending = await repo.claim_pending_runs(
-                self.worker_id, self.settings.worker_lease_seconds, free - len(abandoned)
+                self.worker_id,
+                self.lease_token,
+                self.settings.worker_lease_seconds,
+                free - len(abandoned),
             )
             launched.extend(pending)
         if pending:
@@ -186,7 +211,7 @@ class Worker:
             await asyncio.sleep(interval)
             async with self.db.session() as session:
                 renewed = await RunRepository(session).extend_lease(
-                    run_id, self.worker_id, self.settings.worker_lease_seconds
+                    run_id, self.lease_token, self.settings.worker_lease_seconds
                 )
             if not renewed:
                 # Someone else owns the run now (or it finished). Stop working on it.

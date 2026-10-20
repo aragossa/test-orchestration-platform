@@ -31,6 +31,7 @@ from app.persistence.db import Database
 from app.persistence.models import Run, RunTest
 from app.persistence.repository import (
     EnvironmentBusyError,
+    LostOwnershipError,
     RunRepository,
     StaleRunError,
     utcnow,
@@ -45,18 +46,34 @@ class RunCancelledError(Exception):
     pass
 
 
+class DeploymentOutcomeUnknownError(Exception):
+    """The run's deployment was already requested by a worker that lost the
+    run; whether it went out is unknown, so it is not requested again."""
+
+
 class RunExecutor:
+    """Executes runs on behalf of one worker process.
+
+    `lease_token` is the process's fencing token: every write the executor
+    makes passes `owner=lease_token`, so once another worker has taken a run
+    over (and written its own token) this executor's writes are refused with
+    LostOwnershipError and it stops. A stale worker can never record a result
+    or move a run it no longer holds.
+    """
+
     def __init__(
         self,
         db: Database,
         infrastructure: InfrastructureAdapter,
         test_runner: TestExecutionAdapter,
         worker_id: str,
+        lease_token: str,
     ) -> None:
         self.db = db
         self.infrastructure = infrastructure
         self.test_runner = test_runner
         self.worker_id = worker_id
+        self.lease_token = lease_token
 
     # ------------------------------------------------------------ entry point
 
@@ -76,10 +93,14 @@ class RunExecutor:
                         run_id,
                         RunState.PENDING,
                         RunState.PREPARING,
+                        owner=self.lease_token,
                         current_step="Preparing environment",
                     )
                 except EnvironmentBusyError:
                     await self._park_for_busy_environment(repo, run)
+                    return
+                except LostOwnershipError as exc:
+                    log.warning("run %s: %s", run_id, exc)
                     return
                 await repo.add_event(
                     run_id,
@@ -101,6 +122,10 @@ class RunExecutor:
                     await self._cancel(run_id, state)
                     return
                 state = await self._step(run_id, state, config)
+        except LostOwnershipError as exc:
+            # Another worker took the run over; it continues from the database
+            # state, and every write we might still attempt is fenced out.
+            log.warning("run %s: %s", run_id, exc)
         except StaleRunError as exc:
             log.info("run %s: %s", run_id, exc)
         except RunCancelledError:
@@ -110,7 +135,7 @@ class RunExecutor:
             # the next worker (or this one after restart) resumes the step.
             log.info("run %s: execution interrupted in %s", run_id, state)
             raise
-        except InfrastructureError as exc:
+        except (InfrastructureError, DeploymentOutcomeUnknownError) as exc:
             await self._fail(run_id, state, str(exc))
         except Exception as exc:  # noqa: BLE001 - last line of defence, must not leak
             log.exception("run %s: unexpected error in %s", run_id, state)
@@ -145,36 +170,59 @@ class RunExecutor:
                 run_id,
                 RunState.PREPARING,
                 RunState.DEPLOYING,
+                owner=self.lease_token,
                 current_step=f"Deploying {config.deployment_version}",
             )
         return RunState.DEPLOYING
 
     async def _deploy(self, run_id: int, config: RunConfig) -> RunState:
+        """Request the deployment at most once per run.
+
+        The marker `deploy_requested_at` is written (fenced on our lease) right
+        before the infrastructure is called. If a run arrives here with the
+        marker already set, a previous owner requested the deployment and lost
+        the run before recording the outcome; requesting again could start the
+        same deployment twice, so the run is failed instead.
+        """
         async with self.db.session() as session:
             repo = RunRepository(session)
+            run = await repo.get_run_or_raise(run_id)
+            if run.deploy_requested_at is not None:
+                raise DeploymentOutcomeUnknownError(
+                    f"Deployment of {config.deployment_version} was already requested by "
+                    f"worker {run.deploy_requested_by} at "
+                    f"{run.deploy_requested_at.isoformat(timespec='seconds')}; its outcome is "
+                    "unknown after the worker lost the run, so it is not requested again "
+                    "to avoid a duplicate deployment"
+                )
+            await repo.mark_deploy_requested(run_id, self.lease_token, self.worker_id)
             await repo.add_event(
                 run_id,
                 f"Deployment started: {config.deployment_version}",
                 payload={
+                    "worker": self.worker_id,
                     "worker_instances": config.worker_instances,
                     "data_generators": config.data_generators,
                 },
             )
-        result = await self.infrastructure.deploy(config.environment, config)
+        result = await self.infrastructure.deploy(
+            config.environment, config, idempotency_key=f"run-{run_id}"
+        )
         async with self.db.session() as session:
             repo = RunRepository(session)
+            await repo.transition(
+                run_id,
+                RunState.DEPLOYING,
+                RunState.WAITING_FOR_READY,
+                owner=self.lease_token,
+                deployment_id=result.deployment_id,
+                current_step="Waiting for deployment readiness",
+            )
             await repo.add_event(
                 run_id,
                 f"Deployment created: {result.deployment_id}"
                 + (f" ({result.details})" if result.details else ""),
                 payload={"deployment_id": result.deployment_id, "version": result.version},
-            )
-            await repo.transition(
-                run_id,
-                RunState.DEPLOYING,
-                RunState.WAITING_FOR_READY,
-                deployment_id=result.deployment_id,
-                current_step="Waiting for deployment readiness",
             )
         return RunState.WAITING_FOR_READY
 
@@ -192,6 +240,7 @@ class RunExecutor:
                 run_id,
                 RunState.WAITING_FOR_READY,
                 RunState.RUNNING_TESTS,
+                owner=self.lease_token,
                 current_step="Running tests",
             )
             await repo.add_event(run_id, "Test execution started")
@@ -229,6 +278,7 @@ class RunExecutor:
                 run_id,
                 RunState.RUNNING_TESTS,
                 RunState.COLLECTING_RESULTS,
+                owner=self.lease_token,
                 current_step="Collecting results",
             )
         return RunState.COLLECTING_RESULTS
@@ -241,9 +291,17 @@ class RunExecutor:
         async with self.db.session() as session:
             repo = RunRepository(session)
             await repo.update_test(
-                run_test.id, status=TestStatus.RUNNING, started_at=utcnow(), finished_at=None
+                run_test.id,
+                owner=self.lease_token,
+                status=TestStatus.RUNNING,
+                started_at=utcnow(),
+                finished_at=None,
             )
-            await repo.update_run(run_id, current_step=f"Running test {index} of {total}: {name}")
+            await repo.update_run(
+                run_id,
+                owner=self.lease_token,
+                current_step=f"Running test {index} of {total}: {name}",
+            )
             await repo.add_event(run_id, f"{name} started", payload={"test_id": run_test.test_id})
 
         try:
@@ -264,6 +322,7 @@ class RunExecutor:
             repo = RunRepository(session)
             await repo.update_test(
                 run_test.id,
+                owner=self.lease_token,
                 status=result.status,
                 duration_ms=result.duration_ms,
                 message=result.message,
@@ -294,7 +353,9 @@ class RunExecutor:
             summary = f"{len(passed)}/{len(tests)} tests passed"
 
             if not not_passed:
-                await repo.transition(run_id, RunState.COLLECTING_RESULTS, RunState.COMPLETED)
+                await repo.transition(
+                    run_id, RunState.COLLECTING_RESULTS, RunState.COMPLETED, owner=self.lease_token
+                )
                 await repo.add_event(run_id, f"Run completed successfully: {summary}")
                 return RunState.COMPLETED
 
@@ -307,6 +368,7 @@ class RunExecutor:
                 reason=reason,
                 skip_message="Skipped: run failed before execution",
                 event_message=f"Run failed: {reason}",
+                owner=self.lease_token,
             )
             return RunState.FAILED
 
@@ -327,6 +389,7 @@ class RunExecutor:
                     skip_message="Skipped: run failed before execution",
                     event_message=f"Run failed during {state}: {reason}",
                     event_payload={"failed_in": state},
+                    owner=self.lease_token,
                 )
             except StaleRunError as exc:
                 log.info("run %s: could not mark failed: %s", run_id, exc)
@@ -342,6 +405,7 @@ class RunExecutor:
                     skip_message="Skipped: run cancelled",
                     event_message=f"Run cancelled during {state}",
                     event_level="warning",
+                    owner=self.lease_token,
                 )
             except StaleRunError as exc:
                 log.info("run %s: could not cancel: %s", run_id, exc)
@@ -355,8 +419,8 @@ class RunExecutor:
                 f"Environment '{run.environment_id}' is busy with another run; waiting",
                 level="warning",
             )
-        await repo.update_run(run.id, current_step=waiting_step)
-        await repo.release_claim(run.id, self.worker_id)
+        await repo.update_run(run.id, owner=self.lease_token, current_step=waiting_step)
+        await repo.release_claim(run.id, self.lease_token)
 
     # --------------------------------------------------------------- helpers
 

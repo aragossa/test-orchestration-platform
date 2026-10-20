@@ -73,8 +73,18 @@ class InfrastructureAdapter(Protocol):
     async def prepare_environment(self, environment: str, config: RunConfig) -> None:
         """Make the environment ready to receive a deployment."""
 
-    async def deploy(self, environment: str, config: RunConfig) -> DeploymentResult:
-        """Deploy the requested configuration. Raises DeploymentFailedError."""
+    async def deploy(
+        self, environment: str, config: RunConfig, *, idempotency_key: str
+    ) -> DeploymentResult:
+        """Deploy the requested configuration. Raises DeploymentFailedError.
+
+        `idempotency_key` is stable for the lifetime of a run (`run-<id>`).
+        A real adapter should derive the deployment's name from it (Helm
+        release, Kubernetes Deployment) so that a repeated request for the
+        same run updates the existing deployment instead of creating a second
+        one. The engine never relies on this: it refuses to re-request a
+        deployment whose outcome it does not know (see RunExecutor._deploy).
+        """
 
     async def wait_until_ready(self, deployment_id: str, timeout_ms: int) -> None:
         """Block until the deployment reports ready. Raises ReadinessTimeoutError."""

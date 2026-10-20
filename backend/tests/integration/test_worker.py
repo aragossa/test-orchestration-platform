@@ -16,7 +16,13 @@ from app.persistence.models import Run, RunTest
 from app.persistence.repository import RunRepository, WorkerRepository
 from app.services import RunService
 from app.worker_service import serve
-from tests.conftest import GateInfrastructure, SpyTestRunner, eventually, make_config
+from tests.conftest import (
+    DeployGateInfrastructure,
+    GateInfrastructure,
+    SpyTestRunner,
+    eventually,
+    make_config,
+)
 
 
 async def create(db: Database, **overrides: object) -> int:
@@ -247,29 +253,45 @@ async def _load(db: Database, run_id: int) -> Run:
         return await RunRepository(session).get_run_or_raise(run_id)
 
 
-async def test_run_interrupted_in_deploying_redoes_the_deployment(
-    db: Database, make_worker: Callable[..., Worker]
-) -> None:
-    run_id = await create(db)
+async def _abandon_in_deploying(db: Database, run_id: int, *, deploy_requested: bool) -> None:
+    """Put a run in DEPLOYING with an expired lease held by a dead worker."""
     async with db.session() as session:
         repo = RunRepository(session)
         await repo.transition(run_id, RunState.PENDING, RunState.PREPARING)
         await repo.transition(run_id, RunState.PREPARING, RunState.DEPLOYING)
-        await session.execute(
-            update(Run)
-            .where(Run.id == run_id)
-            .values(worker_id="dead", lease_expires_at=datetime.now(UTC) - timedelta(5))
-        )
+        values: dict[str, object] = {
+            "worker_id": "dead",
+            "lease_token": "dead-token",
+            "lease_expires_at": datetime.now(UTC) - timedelta(5),
+        }
+        if deploy_requested:
+            values |= {
+                "deploy_requested_at": datetime.now(UTC) - timedelta(10),
+                "deploy_requested_by": "dead",
+            }
+        await session.execute(update(Run).where(Run.id == run_id).values(**values))
         await session.commit()
 
-    worker = make_worker(worker_id="alive")
+
+async def test_run_interrupted_before_requesting_the_deployment_deploys_once(
+    db: Database, make_worker: Callable[..., Worker]
+) -> None:
+    """The dead worker reached DEPLOYING but never asked the infrastructure to
+    deploy (no marker): the new owner deploys, exactly once."""
+    run_id = await create(db)
+    await _abandon_in_deploying(db, run_id, deploy_requested=False)
+
+    infrastructure = DeployGateInfrastructure()
+    infrastructure.gate.set()
+    worker = make_worker(infrastructure=infrastructure, worker_id="alive")
     assert await worker.tick() == [run_id]
     await worker.wait_idle()
 
-    async with db.session() as session:
-        run = await RunRepository(session).get_run_or_raise(run_id)
+    run = await _load(db, run_id)
     assert run.state == RunState.COMPLETED
     assert run.deployment_id is not None
+    assert infrastructure.deploy_calls == [f"run-{run_id}"]
+    assert run.deploy_requested_by == "alive"
     assert [t.to_state for t in run.transitions] == [
         "PENDING",
         "PREPARING",
@@ -279,6 +301,123 @@ async def test_run_interrupted_in_deploying_redoes_the_deployment(
         "COLLECTING_RESULTS",
         "COMPLETED",
     ]
+
+
+async def test_run_interrupted_after_requesting_the_deployment_is_not_redeployed(
+    db: Database, make_worker: Callable[..., Worker]
+) -> None:
+    """The dead worker had already asked the infrastructure to deploy; whether
+    that deployment went out is unknown. Deploying again could start it twice,
+    so the run is failed with the reason recorded, and the infrastructure is
+    not called."""
+    run_id = await create(db)
+    await _abandon_in_deploying(db, run_id, deploy_requested=True)
+
+    infrastructure = DeployGateInfrastructure()
+    infrastructure.gate.set()
+    runner = SpyTestRunner()
+    worker = make_worker(infrastructure=infrastructure, runner=runner, worker_id="alive")
+    assert await worker.tick() == [run_id]
+    await worker.wait_idle()
+
+    run = await _load(db, run_id)
+    assert run.state == RunState.FAILED
+    assert infrastructure.deploy_calls == []
+    assert runner.calls == []
+    assert "already requested by worker dead" in (run.error_message or "")
+    assert "not requested again" in (run.error_message or "")
+    assert [t.status for t in run.tests] == [TestStatus.SKIPPED] * 3
+    assert run.transitions[-1].from_state == RunState.DEPLOYING
+    assert run.deploy_requested_by == "dead"  # the marker is history, not overwritten
+
+
+async def test_takeover_while_deploying_never_starts_a_second_deployment(
+    db: Database, make_worker: Callable[..., Worker]
+) -> None:
+    """Worker A is inside infrastructure.deploy() when its lease lapses and
+    worker B takes the run over. B must not deploy again, and A's late result
+    must not be recorded over B's outcome."""
+    infra_a = DeployGateInfrastructure()
+    worker_a = make_worker(infrastructure=infra_a, worker_id="worker-a")
+    run_id = await create(db)
+    assert await worker_a.tick() == [run_id]
+    await infra_a.entered.wait()  # A has requested the deployment and is waiting on it
+
+    # A's lease lapses (it stalled); B reclaims the run on its next tick.
+    async with db.session() as session:
+        await session.execute(
+            update(Run)
+            .where(Run.id == run_id)
+            .values(lease_expires_at=datetime.now(UTC) - timedelta(1))
+        )
+        await session.commit()
+    infra_b = DeployGateInfrastructure()
+    infra_b.gate.set()
+    worker_b = make_worker(infrastructure=infra_b, worker_id="worker-b")
+    assert await worker_b.tick() == [run_id]
+    await worker_b.wait_idle()
+
+    run = await _load(db, run_id)
+    assert run.state == RunState.FAILED
+    assert infra_b.deploy_calls == []  # B saw A's marker and did not deploy
+    assert "already requested by worker worker-a" in (run.error_message or "")
+
+    # A's deployment finally "completes"; its attempt to record it is fenced out.
+    infra_a.gate.set()
+    await worker_a.wait_idle()
+    await worker_a.stop()
+    again = await _load(db, run_id)
+    assert again.state == RunState.FAILED
+    assert again.deployment_id is None
+    assert infra_a.deploy_calls == [f"run-{run_id}"]
+    assert len(again.transitions) == len(run.transitions)
+    assert not any("Deployment created" in e.message for e in again.events)
+
+
+async def test_same_worker_id_alive_disables_reclaiming_its_runs_on_startup(
+    db: Database, make_worker: Callable[..., Worker]
+) -> None:
+    """Two processes sharing a WORKER_ID (misconfiguration) must not rob each
+    other: a starting worker only takes back "its own" runs if no process with
+    that id is heartbeating."""
+    gate = GateInfrastructure()
+    first = make_worker(infrastructure=gate, worker_id="shared")
+    run_id = await create(db)
+    assert await first.tick() == [run_id]  # heartbeat written, run leased
+    await gate.entered.wait()
+
+    twin = make_worker(worker_id="shared")
+    await twin.start()
+    try:
+        await twin.wait_idle()
+        assert twin.recovered_run_ids == []
+        assert (await _load(db, run_id)).lease_token == first.lease_token
+    finally:
+        await twin.stop()
+
+    gate.gate.set()
+    await first.wait_idle()
+    await first.stop()
+    assert await state_of(db, run_id) == RunState.COMPLETED
+
+    # Once the first process has stopped, a restart with the same id does take over.
+    restarted = make_worker(worker_id="shared")
+    other = await create(db)
+    async with db.session() as session:
+        repo = RunRepository(session)
+        await repo.transition(other, RunState.PENDING, RunState.PREPARING)
+        await repo.update_run(
+            other,
+            worker_id="shared",
+            lease_token="gone",
+            lease_expires_at=datetime.now(UTC) + timedelta(60),
+        )
+    await restarted.start()
+    try:
+        await eventually(lambda: _status_is(db, other, RunState.COMPLETED))
+    finally:
+        await restarted.stop()
+    assert restarted.recovered_run_ids == [other]
 
 
 async def test_lost_lease_stops_the_run_task(
@@ -292,7 +431,11 @@ async def test_lost_lease_stops_the_run_task(
 
     # Another worker steals the run (as it would after the lease lapsed).
     async with db.session() as session:
-        await session.execute(update(Run).where(Run.id == run_id).values(worker_id="w-fast"))
+        await session.execute(
+            update(Run)
+            .where(Run.id == run_id)
+            .values(worker_id="w-fast", lease_token="token-of-w-fast")
+        )
         await session.commit()
 
     # Heartbeat (1s in tests) notices and cancels the local task.

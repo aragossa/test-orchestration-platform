@@ -10,6 +10,7 @@ from app.domain.states import InvalidTransitionError, RunState, TestStatus
 from app.persistence.db import Database
 from app.persistence.repository import (
     EnvironmentBusyError,
+    LostOwnershipError,
     RunRepository,
     StaleRunError,
     utcnow,
@@ -90,13 +91,13 @@ async def test_claim_skips_runs_whose_environment_is_busy(db: Database) -> None:
         free = await repo.create_run(make_config(environment="test"))
         await repo.transition(busy.id, RunState.PENDING, RunState.PREPARING)
 
-        claimed = await repo.claim_pending_runs("w1", lease_seconds=10, limit=10)
+        claimed = await repo.claim_pending_runs("w1", "t1", lease_seconds=10, limit=10)
         assert claimed == [free.id]
         # Claimed rows are not handed out twice while the lease holds.
-        assert await repo.claim_pending_runs("w2", lease_seconds=10, limit=10) == []
+        assert await repo.claim_pending_runs("w2", "t2", lease_seconds=10, limit=10) == []
 
         await repo.transition(busy.id, RunState.PREPARING, RunState.FAILED, reason="x")
-        assert await repo.claim_pending_runs("w1", lease_seconds=10, limit=10) == [waiting.id]
+        assert await repo.claim_pending_runs("w1", "t1", lease_seconds=10, limit=10) == [waiting.id]
 
 
 async def test_reclaim_takes_only_expired_or_own_leases(db: Database) -> None:
@@ -107,22 +108,29 @@ async def test_reclaim_takes_only_expired_or_own_leases(db: Database) -> None:
         await repo.transition(mine, RunState.PENDING, RunState.PREPARING)
         await repo.transition(theirs, RunState.PENDING, RunState.PREPARING)
         now = utcnow()
-        await repo.update_run(mine, worker_id="worker-a", lease_expires_at=now + timedelta(60))
+        await repo.update_run(
+            mine, worker_id="worker-a", lease_token="a-old", lease_expires_at=now + timedelta(60)
+        )
         # worker-b stopped heartbeating long ago.
-        await repo.update_run(theirs, worker_id="worker-b", lease_expires_at=now - timedelta(60))
+        await repo.update_run(
+            theirs, worker_id="worker-b", lease_token="b-old", lease_expires_at=now - timedelta(60)
+        )
 
         # Regular tick: only lapsed leases are taken.
-        assert await repo.reclaim_abandoned_runs("worker-a", 60, 10) == [theirs]
+        assert await repo.reclaim_abandoned_runs("worker-a", "a-new", 60, 10) == [theirs]
         # Startup of worker-a: it also takes back what it owned before restart,
         # even though those leases are still valid (both runs are its own now).
-        assert await repo.reclaim_abandoned_runs("worker-a", 60, 10, include_own=True) == [
+        assert await repo.reclaim_abandoned_runs("worker-a", "a-new", 60, 10, include_own=True) == [
             mine,
             theirs,
         ]
+        # Taking over rewrites the token, which fences out the previous holder.
+        assert (await repo.get_run_or_raise(mine)).lease_token == "a-new"
 
-        # extend_lease refuses to renew a lease the worker no longer owns.
-        assert await repo.extend_lease(theirs, "worker-b", 60) is False
-        assert await repo.extend_lease(theirs, "worker-a", 60) is True
+        # extend_lease refuses to renew a lease the token no longer holds.
+        assert await repo.extend_lease(theirs, "b-old", 60) is False
+        assert await repo.extend_lease(theirs, "a-old", 60) is False
+        assert await repo.extend_lease(theirs, "a-new", 60) is True
 
 
 async def test_transitions_and_events_are_logged(
@@ -258,3 +266,77 @@ async def test_reconcile_skips_leftover_tests_of_finished_runs_only(db: Database
         run = await RunRepository(session).get_run_or_raise(broken)
     assert run.events[-1].level == "warning"
     assert "marked SKIPPED on startup" in run.events[-1].message
+
+
+async def test_writes_fenced_on_the_lease_token_refuse_a_previous_owner(db: Database) -> None:
+    """Every write a worker makes carries its lease token. Once another worker
+    has taken the run over (new token), the old owner's writes are refused and
+    nothing is changed."""
+    async with db.session() as session:
+        repo = RunRepository(session)
+        run_id = (await repo.create_run(make_config())).id
+        await repo.claim_pending_runs("w-old", "old", lease_seconds=60, limit=1)
+        await repo.transition(run_id, RunState.PENDING, RunState.PREPARING, owner="old")
+        test_id = (await repo.get_run_or_raise(run_id)).tests[0].id
+
+        # w-new takes over after the lease lapsed.
+        await repo.update_run(run_id, lease_expires_at=utcnow() - timedelta(1))
+        assert await repo.reclaim_abandoned_runs("w-new", "new", 60, 1) == [run_id]
+
+        with pytest.raises(LostOwnershipError):
+            await repo.transition(run_id, RunState.PREPARING, RunState.DEPLOYING, owner="old")
+        with pytest.raises(LostOwnershipError):
+            await repo.update_run(run_id, owner="old", current_step="stale")
+        with pytest.raises(LostOwnershipError):
+            await repo.update_test(test_id, owner="old", status=TestStatus.PASSED)
+        with pytest.raises(LostOwnershipError):
+            await repo.finish_run(
+                run_id,
+                RunState.PREPARING,
+                RunState.FAILED,
+                reason="stale",
+                skip_message="x",
+                event_message="x",
+                owner="old",
+            )
+        with pytest.raises(LostOwnershipError):
+            await repo.mark_deploy_requested(run_id, owner="old", worker_id="w-old")
+
+        run = await repo.get_run_or_raise(run_id)
+        assert run.state == RunState.PREPARING
+        assert run.worker_id == "w-new" and run.lease_token == "new"
+        assert run.current_step != "stale"
+        assert run.deploy_requested_at is None
+        assert [t.status for t in run.tests] == [TestStatus.PENDING] * 3
+        assert [t.to_state for t in run.transitions] == ["PENDING", "PREPARING"]
+
+        # The current owner's writes go through.
+        await repo.transition(run_id, RunState.PREPARING, RunState.DEPLOYING, owner="new")
+        await repo.mark_deploy_requested(run_id, owner="new", worker_id="w-new")
+        run = await repo.get_run_or_raise(run_id)
+        assert run.state == RunState.DEPLOYING
+        assert run.deploy_requested_by == "w-new" and run.deploy_requested_at is not None
+
+
+async def test_deploy_can_be_requested_at_most_once_per_run(db: Database) -> None:
+    async with db.session() as session:
+        repo = RunRepository(session)
+        run_id = (await repo.create_run(make_config())).id
+        await repo.claim_pending_runs("w", "tok", lease_seconds=60, limit=1)
+        await repo.transition(run_id, RunState.PENDING, RunState.PREPARING, owner="tok")
+        await repo.transition(run_id, RunState.PREPARING, RunState.DEPLOYING, owner="tok")
+        await repo.mark_deploy_requested(run_id, owner="tok", worker_id="w")
+        # Same owner, second request: refused, the marker is not overwritten.
+        with pytest.raises(LostOwnershipError):
+            await repo.mark_deploy_requested(run_id, owner="tok", worker_id="w")
+
+
+async def test_terminal_transition_clears_the_lease_token(db: Database) -> None:
+    async with db.session() as session:
+        repo = RunRepository(session)
+        run_id = (await repo.create_run(make_config())).id
+        await repo.claim_pending_runs("w", "tok", lease_seconds=60, limit=1)
+        await repo.transition(run_id, RunState.PENDING, RunState.PREPARING, owner="tok")
+        await repo.transition(run_id, RunState.PREPARING, RunState.FAILED, owner="tok", reason="x")
+        run = await repo.get_run_or_raise(run_id)
+        assert run.worker_id is None and run.lease_token is None

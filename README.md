@@ -186,7 +186,7 @@ Seven tables (see `backend/alembic/versions/`):
 |---|---|
 | `environments` | `test` and `stage` with their default worker/generator counts, version and timeout. Editable through `PUT /api/environments/{id}`. |
 | `test_definitions` | The catalog of five tests (name, category, description, mock base duration). |
-| `runs` | One row per run: `state`, `config_snapshot` (JSONB copy of the validated config), `failure_simulation`, `current_step`, `error_message`, `deployment_id`, `worker_id`, `lease_expires_at`, `cancel_requested_at`, timestamps. |
+| `runs` | One row per run: `state`, `config_snapshot` (JSONB copy of the validated config), `failure_simulation`, `current_step`, `error_message`, `deployment_id`, `worker_id`, `lease_token`, `lease_expires_at`, `deploy_requested_at`/`_by`, `cancel_requested_at`, timestamps. |
 | `run_tests` | One row per selected test: status (`PENDING`, `RUNNING`, `PASSED`, `FAILED`, `TIMED_OUT`, `SKIPPED`), duration, message, error, timestamps. Created up front so "not executed" is visible. |
 | `run_transitions` | Full state history. |
 | `run_events` | Human-readable timeline ("Deployment started: stable", "Connectivity Check passed (2.0s)"), with level and optional payload. |
@@ -243,9 +243,18 @@ safe:
 
 1. **The database is the queue and the journal.** A run's `state` says which
    step was in progress; `run_tests.status` says which tests are done.
-2. **Leases.** When a worker claims a run it writes `worker_id` and
-   `lease_expires_at = now + 15 s`, and a heartbeat task renews the lease
-   every 5 s while the run executes.
+2. **Leases and fencing.** When a worker claims a run it writes `worker_id`
+   (its stable identity: the container hostname), `lease_token` (a uuid
+   generated at process start) and `lease_expires_at = now() + 15 s`
+   (database time, so hosts with drifting clocks compare against one clock).
+   A heartbeat task renews the lease every 5 s while the run executes.
+   Every write the executor makes — transitions, `current_step`, test
+   statuses, `finish_run` — carries `owner=lease_token` and is conditioned on
+   `runs.lease_token = owner` in the same statement. Taking a run over writes
+   a new token, so the previous holder's next write is refused with
+   `LostOwnershipError` and it stops; a worker that lost a run can never
+   record a result or move its state, however late it wakes up. The
+   heartbeat noticing a failed renewal only makes this faster.
 3. **Recovery on startup.** `Worker._recover_on_startup` first runs
    `RunRepository.reconcile_terminal_runs`, a safety net that marks `SKIPPED`
    any `PENDING`/`RUNNING` test of a run that is already terminal and records
@@ -255,20 +264,57 @@ safe:
    active run whose lease has expired *or* whose `worker_id` equals its own
    (the id is the container hostname, which survives a restart, so a
    restarted container takes its own runs back immediately rather than
-   after 15 s). Each tick also
-   reclaims expired leases, which covers a second worker taking over from a
-   dead one, or a new worker taking over from an old one after a redeploy.
+   after 15 s). The "its own" part is skipped, with a warning, if a process
+   with the same id is still heartbeating: that means `WORKER_ID` is shared
+   by several replicas, and the newcomer must not rob a live worker. Each
+   tick also reclaims expired leases, which covers a second worker taking
+   over from a dead one, or a new worker taking over from an old one after a
+   redeploy.
 4. **Resumption.** `RunExecutor.execute` is entered with the run already in an
    active state. It records a warning event (`Run resumed from RUNNING_TESTS
    after backend restart`) and re-runs the step for that state:
-   `PREPARING`/`DEPLOYING` redo the operation from scratch (a new deployment
-   id is issued), `WAITING_FOR_READY` waits again on the stored deployment id,
+   `PREPARING` redoes the preparation; `DEPLOYING` is **at most once** (see
+   below): if the deployment was never requested the new owner requests it,
+   otherwise the run is failed rather than deployed a second time;
+   `WAITING_FOR_READY` waits again on the stored deployment id,
    `RUNNING_TESTS` skips tests that already have a final status, re-runs the
    one that was `RUNNING`, and continues with the rest; `COLLECTING_RESULTS`
    just recomputes the verdict.
 5. **Nothing is lost on shutdown.** A graceful stop cancels the run tasks;
    the executor re-raises `CancelledError` without touching the row, so the
    lease simply lapses and the next worker continues.
+
+### The deployment is requested at most once per run
+
+The one step that must not run twice is `deploy`: a second request for the
+same run could start the same deployment twice. Fencing alone does not
+prevent it — worker A may be inside `infrastructure.deploy()` when its lease
+lapses and worker B resumes the run in `DEPLOYING`. So `_deploy` works like
+this:
+
+1. Re-read the run. If `deploy_requested_at` is already set, a previous
+   owner asked the infrastructure to deploy and lost the run before recording
+   the outcome. Whether that deployment went out is unknown, so the run is
+   failed with the reason spelled out (`Deployment of v1 was already
+   requested by worker X at …; its outcome is unknown …, so it is not
+   requested again to avoid a duplicate deployment`). Its tests are skipped
+   in the same transaction; the infrastructure is not called.
+2. Otherwise write the marker with `mark_deploy_requested`: a fenced update
+   on `lease_token = owner AND deploy_requested_at IS NULL`. It succeeds at
+   most once per run, so two workers can never both pass it.
+3. Only then call `infrastructure.deploy(…, idempotency_key="run-<id>")`
+   and, on return, record `deployment_id` with a fenced transition. If the
+   run was taken over in the meantime the result is refused, not written.
+
+This is a deliberate trade-off: a worker crash exactly between step 2 and the
+transition to `WAITING_FOR_READY` now fails the run instead of resuming it,
+because resuming would mean guessing. Without idempotency on the
+infrastructure side exactly-once is not achievable; at-most-once with an
+explicit reason is the safe default. The `idempotency_key` is part of the
+adapter contract so that a real adapter can do better (derive the Helm
+release / Kubernetes Deployment name from it, making a repeat a no-op); the
+mock does *not* deduplicate on it, because its memory is per process and
+pretending otherwise would advertise a guarantee two replicas do not have.
 
 This was verified by sending `SIGKILL` to the worker container in the middle of
 `RUNNING_TESTS` and restarting it: the already-passed test was not re-run, the
@@ -294,6 +340,11 @@ report success until a heartbeat is fresh.
   processes poll the same table without double-claiming:
   `docker compose up -d --scale worker=3` works as is. Leave `WORKER_ID`
   empty when scaling; each container then identifies itself by hostname.
+  Correctness does not depend on it: writes are fenced on the per-process
+  `lease_token`, not on `worker_id`. A shared id only costs the fast
+  take-back of own runs after a restart (the newcomer waits for the lease
+  like any other worker) and makes the replicas indistinguishable in
+  `/api/health`.
 - A partial unique index `uq_runs_one_active_per_environment ON runs
   (environment_id) WHERE state IN (PREPARING, …, COLLECTING_RESULTS)` makes
   "one active deployment per environment" a database guarantee. The claim
@@ -310,7 +361,9 @@ report success until a heartbeat is fresh.
 ```python
 class InfrastructureAdapter(Protocol):
     async def prepare_environment(self, environment: str, config: RunConfig) -> None: ...
-    async def deploy(self, environment: str, config: RunConfig) -> DeploymentResult: ...
+    async def deploy(
+        self, environment: str, config: RunConfig, *, idempotency_key: str
+    ) -> DeploymentResult: ...
     async def wait_until_ready(self, deployment_id: str, timeout_ms: int) -> None: ...
 
 class TestExecutionAdapter(Protocol):
@@ -356,7 +409,7 @@ the backend is authoritative.
 
 ```bash
 cd backend
-uv run pytest            # 82 tests, ~15 s, needs the docker-compose database
+uv run pytest            # 88 tests, ~16 s, needs the docker-compose database
 uv run ruff check . && uv run mypy app
 ```
 
@@ -364,15 +417,18 @@ uv run ruff check . && uv run mypy app
 - `tests/integration/test_repository.py` — legal/illegal transitions,
   optimistic locking, the partial unique index, claiming and leasing,
   `finish_run` committing exactly once and rolling back as a whole, the
-  startup reconcile sweep.
+  startup reconcile sweep, writes fenced on the lease token, the
+  at-most-once deployment marker.
 - `tests/integration/test_executor.py` — every scenario end to end against
   PostgreSQL with zero-delay mocks: happy path, deployment failure (tests
   skipped, runner never called), test failure, test timeout, readiness
   timeout, unexpected exceptions.
 - `tests/integration/test_worker.py` — concurrency across environments,
   queueing on a busy environment, cancellation (queued, mid-step and
-  mid-test), lost leases, three restart/resume scenarios, heartbeats and the
-  standalone worker process (`app.worker_service`).
+  mid-test), lost leases, restart/resume scenarios including take-over in
+  `DEPLOYING` with and without a requested deployment, two workers sharing a
+  `WORKER_ID`, heartbeats and the standalone worker process
+  (`app.worker_service`).
 - `tests/integration/test_api.py` — the HTTP contract, validation errors,
   snapshot immutability, filters, pagination, and `/health` turning `ok`
   only while a worker heartbeats.
@@ -422,9 +478,11 @@ build and a Docker build on every push.
 - **Tests run sequentially within a run.** `worker_instances` and
   `data_generators` are passed to the adapters and shown in events but the
   mock does not parallelise on them.
-- **Resumption redoes `PREPARING`/`DEPLOYING` from scratch.** Safe with mocks;
-  a real infrastructure adapter would need idempotent operations (e.g. keyed
-  by run id) or a reconciliation step that inspects existing resources.
+- **A run interrupted after its deployment was requested fails instead of
+  resuming.** At-most-once is the safe choice while the infrastructure gives
+  no way to look the deployment up; a real adapter honouring
+  `idempotency_key`, or a reconciliation step that inspects existing
+  resources, would let such runs continue.
 - **Cancellation granularity.** A cancel request is noticed between steps
   and, during a test, by a 1 s watcher. The mock test coroutine is cancelled;
   a real runner would need an explicit abort call.
@@ -446,9 +504,10 @@ build and a Docker build on every push.
 - **Fair claiming**: at most one run per tick per worker, plus jitter on the
   polling interval, so several workers share the queue instead of the fastest
   one taking everything.
-- **Idempotency keys for infrastructure operations** and a reconciliation
-  loop that compares desired vs. actual state after a restart instead of
-  blindly redoing steps.
+- **Honour `idempotency_key` in the real infrastructure adapter** and add a
+  reconciliation step that compares desired vs. actual state after a
+  restart, so a run whose deployment was requested but not recorded can be
+  resumed instead of failed.
 - **Push updates**: PostgreSQL `LISTEN/NOTIFY` → SSE/WebSocket for the UI.
 - **Retries with backoff** for transient infrastructure errors, distinguished
   from permanent ones by exception type.

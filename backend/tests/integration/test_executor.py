@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import pytest
+from sqlalchemy import update
 
 from app.adapters import MockInfrastructureAdapter
 from app.domain.states import FailureSimulation, RunState, TestStatus
 from app.orchestration.executor import RunExecutor
 from app.persistence.db import Database
 from app.persistence.models import Run
-from app.persistence.repository import RunRepository
+from app.persistence.repository import RunRepository, utcnow
 from tests.conftest import SpyTestRunner, make_config
 
 HAPPY = [
@@ -34,10 +35,21 @@ async def load(db: Database, run_id: int) -> Run:
         return await RunRepository(session).get_run_or_raise(run_id)
 
 
+TOKEN = "token-test-worker"
+
+
 async def execute(
     db: Database, run_id: int, infrastructure: MockInfrastructureAdapter, runner: SpyTestRunner
 ) -> Run:
-    await RunExecutor(db, infrastructure, runner, "test-worker").execute(run_id)
+    """Drive the executor as the worker would: the run is leased to us first."""
+    async with db.session() as session:
+        await session.execute(
+            update(Run)
+            .where(Run.id == run_id)
+            .values(worker_id="test-worker", lease_token=TOKEN, lease_expires_at=utcnow())
+        )
+        await session.commit()
+    await RunExecutor(db, infrastructure, runner, "test-worker", TOKEN).execute(run_id)
     return await load(db, run_id)
 
 
@@ -160,7 +172,9 @@ async def test_unexpected_adapter_exception_is_recorded_not_leaked(
     db: Database, runner: SpyTestRunner
 ) -> None:
     class Exploding(MockInfrastructureAdapter):
-        async def deploy(self, environment: str, config: object) -> None:  # type: ignore[override]
+        async def deploy(  # type: ignore[override]
+            self, environment: str, config: object, *, idempotency_key: str
+        ) -> None:
             raise RuntimeError("boom")
 
     run_id = await create(db)
