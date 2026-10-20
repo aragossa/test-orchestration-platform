@@ -208,6 +208,14 @@ the worker reloads what it needs from the database at every step.
   `InfrastructureError`) → the run transitions from its current state to
   `FAILED` with the exception message as reason; all unfinished `run_tests`
   become `SKIPPED`; the runner adapter is never invoked.
+- **Finishing is atomic.** Every path that ends a run (`FAILED` from a step,
+  `FAILED` from `COLLECTING_RESULTS`, `CANCELLED` from the worker or from the
+  API while queued) goes through `RunRepository.finish_run`, which writes the
+  state change, the `SKIPPED` marks on unfinished tests, the transition row
+  and the event in **one transaction**. A crash can therefore never leave a
+  run that looks finished while some of its tests are still `PENDING` or
+  `RUNNING`: either the whole outcome is committed or none of it is. Skipping
+  tests is not exposed as a separate repository operation on purpose.
 - **Readiness timeout** → `wait_until_ready` raises `ReadinessTimeoutError`
   after the run's timeout; handled the same way.
 - **Test failure** → the adapter returns `FAILED`; execution continues with
@@ -238,7 +246,12 @@ safe:
 2. **Leases.** When a worker claims a run it writes `worker_id` and
    `lease_expires_at = now + 15 s`, and a heartbeat task renews the lease
    every 5 s while the run executes.
-3. **Recovery on startup.** `Worker._recover_on_startup` reclaims every
+3. **Recovery on startup.** `Worker._recover_on_startup` first runs
+   `RunRepository.reconcile_terminal_runs`, a safety net that marks `SKIPPED`
+   any `PENDING`/`RUNNING` test of a run that is already terminal and records
+   a warning event on it (`finish_run` makes such rows impossible to create;
+   the sweep repairs anything written before it existed and is idempotent).
+   It then reclaims every
    active run whose lease has expired *or* whose `worker_id` equals its own
    (the id is the container hostname, which survives a restart, so a
    restarted container takes its own runs back immediately rather than
@@ -343,13 +356,15 @@ the backend is authoritative.
 
 ```bash
 cd backend
-uv run pytest            # 77 tests, ~15 s, needs the docker-compose database
+uv run pytest            # 82 tests, ~15 s, needs the docker-compose database
 uv run ruff check . && uv run mypy app
 ```
 
 - `tests/unit/` — the state machine and `RunConfig` without any I/O.
 - `tests/integration/test_repository.py` — legal/illegal transitions,
-  optimistic locking, the partial unique index, claiming and leasing.
+  optimistic locking, the partial unique index, claiming and leasing,
+  `finish_run` committing exactly once and rolling back as a whole, the
+  startup reconcile sweep.
 - `tests/integration/test_executor.py` — every scenario end to end against
   PostgreSQL with zero-delay mocks: happy path, deployment failure (tests
   skipped, runner never called), test failure, test timeout, readiness

@@ -180,6 +180,65 @@ class RunRepository:
         the row is not in `expected` any more, and EnvironmentBusyError if the
         move would make a second run active in the same environment.
         """
+        await self._apply_transition(run_id, expected, target, reason, fields)
+        await self.session.commit()
+        log.info("run %s: %s -> %s%s", run_id, expected, target, f" ({reason})" if reason else "")
+
+    async def finish_run(
+        self,
+        run_id: int,
+        expected: RunState,
+        target: RunState,
+        *,
+        reason: str,
+        skip_message: str,
+        event_message: str,
+        event_level: str = "error",
+        event_payload: dict[str, Any] | None = None,
+        **fields: Any,
+    ) -> int:
+        """Move a run to a terminal state, skip its unfinished tests and record
+        the event, all in ONE transaction.
+
+        A run must never be observed as finished while some of its tests are
+        still PENDING or RUNNING, so the three writes are committed together:
+        either all of them land or none does. Returns the number of tests that
+        were marked SKIPPED. Raises the same errors as `transition()`.
+        """
+        if target not in TERMINAL_STATES:
+            raise ValueError(f"finish_run() needs a terminal target, got {target}")
+        fields.setdefault("error_message", reason)
+        await self._apply_transition(run_id, expected, target, reason, fields)
+        skipped = await self._skip_unfinished_tests(run_id, skip_message)
+        self.session.add(
+            RunEvent(
+                run_id=run_id,
+                level=event_level,
+                message=event_message,
+                payload={**(event_payload or {}), "skipped_tests": skipped},
+            )
+        )
+        await self.session.commit()
+        log.log(
+            logging.WARNING if event_level in ("warning", "error") else logging.INFO,
+            "run %s: %s -> %s (%s); %d test(s) skipped",
+            run_id,
+            expected,
+            target,
+            reason,
+            skipped,
+        )
+        return skipped
+
+    async def _apply_transition(
+        self,
+        run_id: int,
+        expected: RunState,
+        target: RunState,
+        reason: str | None,
+        fields: dict[str, Any],
+    ) -> None:
+        """Stage the state change and its history row without committing."""
         assert_transition(expected, target)
         now = utcnow()
         values: dict[str, Any] = {"state": target, "updated_at": now, **fields}
@@ -212,8 +271,6 @@ class RunRepository:
         self.session.add(
             RunTransition(run_id=run_id, from_state=expected, to_state=target, reason=reason)
         )
-        await self.session.commit()
-        log.info("run %s: %s -> %s%s", run_id, expected, target, f" ({reason})" if reason else "")
 
     async def update_run(self, run_id: int, **fields: Any) -> None:
         stmt = update(Run).where(Run.id == run_id).values(updated_at=utcnow(), **fields)
@@ -242,7 +299,12 @@ class RunRepository:
         await self.session.execute(stmt)
         await self.session.commit()
 
-    async def skip_unfinished_tests(self, run_id: int, message: str) -> int:
+    async def _skip_unfinished_tests(self, run_id: int, message: str) -> int:
+        """Stage SKIPPED for the run's unfinished tests without committing.
+
+        Private on purpose: skipping tests is only ever part of finishing a
+        run, and must commit together with the state change (see finish_run).
+        """
         stmt = (
             update(RunTest)
             .where(
@@ -252,8 +314,40 @@ class RunRepository:
             .values(status=TestStatus.SKIPPED, message=message, finished_at=utcnow())
         )
         result = await self.session.execute(stmt)
-        await self.session.commit()
         return int(getattr(result, "rowcount", 0) or 0)
+
+    async def reconcile_terminal_runs(self) -> list[int]:
+        """Repair runs that finished but still have PENDING/RUNNING tests.
+
+        `finish_run` makes this impossible for new runs; this sweep is the
+        safety net for rows written before it existed. Returns the repaired
+        run ids. Idempotent.
+        """
+        terminal_runs = select(Run.id).where(Run.state.in_(list(TERMINAL_STATES)))
+        stmt = (
+            update(RunTest)
+            .where(
+                RunTest.run_id.in_(terminal_runs),
+                RunTest.status.in_([TestStatus.PENDING, TestStatus.RUNNING]),
+            )
+            .values(
+                status=TestStatus.SKIPPED,
+                message="Skipped: run had already finished (repaired on worker startup)",
+                finished_at=utcnow(),
+            )
+            .returning(RunTest.run_id)
+        )
+        run_ids = sorted(set((await self.session.scalars(stmt)).all()))
+        for run_id in run_ids:
+            self.session.add(
+                RunEvent(
+                    run_id=run_id,
+                    level="warning",
+                    message="Unfinished tests of a finished run were marked SKIPPED on startup",
+                )
+            )
+        await self.session.commit()
+        return run_ids
 
     async def request_cancel(self, run_id: int) -> None:
         await self.update_run(run_id, cancel_requested_at=utcnow())

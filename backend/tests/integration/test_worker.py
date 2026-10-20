@@ -212,6 +212,41 @@ async def test_startup_reclaims_runs_this_worker_owned_before_restart(
     assert same.recovered_run_ids == [run_id]
 
 
+async def test_startup_repairs_finished_runs_with_unfinished_tests(
+    db: Database, make_worker: Callable[..., Worker]
+) -> None:
+    """A FAILED run whose tests were never marked (the inconsistent state a
+    crash between two commits used to leave) is repaired before anything else."""
+    run_id = await create(db)
+    async with db.session() as session:
+        repo = RunRepository(session)
+        await repo.transition(run_id, RunState.PENDING, RunState.PREPARING)
+        await repo.transition(run_id, RunState.PREPARING, RunState.FAILED, reason="crashed")
+    assert [t.status for t in (await _load(db, run_id)).tests] == [TestStatus.PENDING] * 3
+
+    worker = make_worker()
+    await worker.start()
+    try:
+        await eventually(lambda: _reconciled(worker, run_id))
+    finally:
+        await worker.stop()
+
+    run = await _load(db, run_id)
+    assert run.state == RunState.FAILED
+    assert [t.status for t in run.tests] == [TestStatus.SKIPPED] * 3
+    assert worker.status()["reconciled_on_startup"] == [run_id]
+    assert worker.recovered_run_ids == []  # a finished run is never resumed
+
+
+async def _reconciled(worker: Worker, run_id: int) -> bool:
+    return run_id in worker.reconciled_run_ids
+
+
+async def _load(db: Database, run_id: int) -> Run:
+    async with db.session() as session:
+        return await RunRepository(session).get_run_or_raise(run_id)
+
+
 async def test_run_interrupted_in_deploying_redoes_the_deployment(
     db: Database, make_worker: Callable[..., Worker]
 ) -> None:

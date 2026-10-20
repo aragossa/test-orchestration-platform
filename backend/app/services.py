@@ -86,16 +86,16 @@ class RunService:
         if state is RunState.PENDING:
             # Nothing is executing yet; finish it right here.
             try:
-                await self.repo.transition(
+                await self.repo.finish_run(
                     run_id,
                     RunState.PENDING,
                     RunState.CANCELLED,
                     reason="Cancelled by user",
-                    error_message="Cancelled by user",
+                    skip_message="Skipped: run cancelled",
+                    event_message="Run cancelled while queued",
+                    event_level="warning",
                     cancel_requested_at=utcnow(),
                 )
-                await self.repo.skip_unfinished_tests(run_id, "Skipped: run cancelled")
-                await self.repo.add_event(run_id, "Run cancelled while queued", level="warning")
                 self.repo.session.expire_all()
                 return await self.get_run(run_id)
             except StaleRunError:

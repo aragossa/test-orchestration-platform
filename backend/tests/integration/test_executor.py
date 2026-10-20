@@ -192,3 +192,5 @@ async def test_every_simulation_reaches_a_terminal_state(
     run = await execute(db, run_id, infrastructure, runner)
     expected = RunState.COMPLETED if simulation is FailureSimulation.NONE else RunState.FAILED
     assert run.state == expected
+    # A finished run never has tests still waiting to be executed.
+    assert all(t.status not in (TestStatus.PENDING, TestStatus.RUNNING) for t in run.tests)

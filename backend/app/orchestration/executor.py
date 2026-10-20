@@ -300,51 +300,51 @@ class RunExecutor:
 
             details = ", ".join(f"{t.test_id}: {t.status}" for t in not_passed)
             reason = f"{len(not_passed)} of {len(tests)} tests did not pass ({details})"
-            await repo.transition(
+            await repo.finish_run(
                 run_id,
                 RunState.COLLECTING_RESULTS,
                 RunState.FAILED,
                 reason=reason,
-                error_message=reason,
+                skip_message="Skipped: run failed before execution",
+                event_message=f"Run failed: {reason}",
             )
-            await repo.add_event(run_id, f"Run failed: {reason}", level="error")
             return RunState.FAILED
 
     # -------------------------------------------------------------- outcomes
+    #
+    # Finishing a run is a single transaction (RunRepository.finish_run): the
+    # state change, the SKIPPED marks on unfinished tests and the event land
+    # together, so a crash can never leave a finished run with pending tests.
 
     async def _fail(self, run_id: int, state: RunState, reason: str) -> None:
         async with self.db.session() as session:
-            repo = RunRepository(session)
             try:
-                await repo.transition(
-                    run_id, state, RunState.FAILED, reason=reason, error_message=reason
+                await RunRepository(session).finish_run(
+                    run_id,
+                    state,
+                    RunState.FAILED,
+                    reason=reason,
+                    skip_message="Skipped: run failed before execution",
+                    event_message=f"Run failed during {state}: {reason}",
+                    event_payload={"failed_in": state},
                 )
             except StaleRunError as exc:
                 log.info("run %s: could not mark failed: %s", run_id, exc)
-                return
-            skipped = await repo.skip_unfinished_tests(
-                run_id, "Skipped: run failed before execution"
-            )
-            await repo.add_event(
-                run_id,
-                f"Run failed during {state}: {reason}",
-                level="error",
-                payload={"failed_in": state, "skipped_tests": skipped},
-            )
 
     async def _cancel(self, run_id: int, state: RunState) -> None:
         async with self.db.session() as session:
-            repo = RunRepository(session)
-            reason = "Cancelled by user"
             try:
-                await repo.transition(
-                    run_id, state, RunState.CANCELLED, reason=reason, error_message=reason
+                await RunRepository(session).finish_run(
+                    run_id,
+                    state,
+                    RunState.CANCELLED,
+                    reason="Cancelled by user",
+                    skip_message="Skipped: run cancelled",
+                    event_message=f"Run cancelled during {state}",
+                    event_level="warning",
                 )
             except StaleRunError as exc:
                 log.info("run %s: could not cancel: %s", run_id, exc)
-                return
-            await repo.skip_unfinished_tests(run_id, "Skipped: run cancelled")
-            await repo.add_event(run_id, f"Run cancelled during {state}", level="warning")
 
     async def _park_for_busy_environment(self, repo: RunRepository, run: Run) -> None:
         """Leave a queued run in PENDING until its environment frees up."""

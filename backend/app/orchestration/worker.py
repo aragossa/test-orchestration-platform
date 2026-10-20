@@ -47,6 +47,7 @@ class Worker:
         self.started_at: datetime | None = None
         self.last_tick_at: datetime | None = None
         self.recovered_run_ids: list[int] = []
+        self.reconciled_run_ids: list[int] = []
 
     # ------------------------------------------------------------- lifecycle
 
@@ -79,6 +80,7 @@ class Worker:
             "started_at": self.started_at,
             "last_tick_at": self.last_tick_at,
             "recovered_on_startup": self.recovered_run_ids,
+            "reconciled_on_startup": self.reconciled_run_ids,
         }
 
     # ------------------------------------------------------------------ loop
@@ -100,10 +102,19 @@ class Worker:
                 pass
 
     async def _recover_on_startup(self) -> None:
-        """Take back runs this worker owned before it restarted, plus any whose
-        lease already lapsed, and resume them."""
+        """Repair finished runs that still have unfinished tests, then take back
+        runs this worker owned before it restarted, plus any whose lease already
+        lapsed, and resume them."""
         async with self.db.session() as session:
-            ids = await RunRepository(session).reclaim_abandoned_runs(
+            repo = RunRepository(session)
+            self.reconciled_run_ids = await repo.reconcile_terminal_runs()
+            if self.reconciled_run_ids:
+                log.warning(
+                    "worker %s: marked leftover tests SKIPPED on finished run(s) %s",
+                    self.worker_id,
+                    self.reconciled_run_ids,
+                )
+            ids = await repo.reclaim_abandoned_runs(
                 self.worker_id,
                 self.settings.worker_lease_seconds,
                 self.settings.worker_concurrency,
