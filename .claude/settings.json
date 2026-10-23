@@ -15,6 +15,7 @@
       "Bash(docker compose -f deploy/docker-compose.prod.yml *)",
       "Bash(gh secret *)",
       "Bash(gh workflow *)",
+      "Bash(gh run rerun *)",
       "Bash(gh release *)"
     ],
     "deny": [
@@ -23,6 +24,18 @@
     ]
   },
   "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-env.sh",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "matcher": "Write|Edit",
