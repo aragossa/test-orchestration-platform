@@ -35,6 +35,12 @@ cd frontend && npm run lint && npm test && npm run build
 - When behaviour changes, update the matching README section in the same commit.
 - Keep the frontend minimal: it renders what the API returns, nothing more.
 
+## Agents
+
+Subagents are defined in `.claude/agents/`; who owns what and how work moves
+between them is in `docs/agent-network.md`. Each agent writes only to its own
+zone. Agents never push, deploy or act on production.
+
 ## Production
 
 - Pushing to `main` deploys to production (CI → Deploy workflow → GHCR → SSH to
