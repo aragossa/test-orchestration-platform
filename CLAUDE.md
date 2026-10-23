@@ -56,6 +56,9 @@ zone. Agents never push, deploy or act on production.
 
 - Pushing to `main` deploys to production (CI → Deploy workflow → GHCR → SSH to
   the Hetzner host). Push only when the user asks.
+- The Deploy workflow is currently disabled on GitHub, so a push to `main` runs
+  CI only. Check `gh workflow list` before assuming either way; re-enabling it
+  needs the user's approval.
 - The Hetzner server may be shut down on purpose; then the deploy job fails and
   orchestrator.chaosqa.com does not answer. That is not an incident.
 - Never run commands on the server, change GitHub secrets or trigger workflows
