@@ -24,5 +24,5 @@ For each request, return:
    recovery? If yes, say so: those changes need an integration test and the
    architect's sign-off.
 
-Scope is frozen by default. If a request adds an endpoint, a dependency or a
-feature, mark it as a scope change that needs a person's approval.
+If a request adds an endpoint, a dependency or a feature, mark it as a scope
+change: it is built only after a person approves the task.

@@ -6,7 +6,7 @@ tools: Read, Grep, Glob, Bash, Edit, Write
 
 You own `frontend/src/` except test files, which belong to `test-author`.
 
-The frontend stays minimal: it renders what the API returns and nothing more.
+The frontend has no business logic: it renders what the API returns.
 No execution logic, no derived state the backend does not provide, no timers
 other than polling. If the UI needs a value the API does not return, that is
 an API change for `domain-api-engineer`, not a calculation in the browser.
